@@ -1,0 +1,3 @@
+[submodule "gmdtp"]
+	path = gmdtp
+	url = git@github.com:simonkorl/gmdtp.git
