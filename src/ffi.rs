@@ -1,5 +1,3 @@
-use std::error;
-use std::ffi;
 use libc::c_char;
 use libc::c_int;
 use libc::c_void;
@@ -7,6 +5,8 @@ use libc::size_t;
 use libc::sockaddr;
 use libc::ssize_t;
 use libc::timespec;
+use std::error;
+use std::ffi;
 
 use quiche::Config;
 use quiche::Error;
@@ -15,15 +15,11 @@ type c_bool = bool;
 
 #[repr(C)]
 #[derive(Default, Debug, Copy, Clone)]
-pub struct DtpConnection {
-
-}
+pub struct DtpConnection {}
 
 #[repr(C)]
 #[derive(Default, Debug, Copy, Clone)]
-pub struct DtpServer {
-
-}
+pub struct DtpServer {}
 
 fn error_to_c(e: Error) -> libc::ssize_t {
     match e {
@@ -45,6 +41,57 @@ fn error_to_c(e: Error) -> libc::ssize_t {
         Error::StreamReset { .. } => -16,
     }
 }
+const QUICHE_PROTOCOL_VERSION: u32 = 0x00000001;
+
+//----------API接口函数声明---------
+//生成默认的 客户端和服务端的配置文件
+#[no_mangle]
+pub extern "C" fn dtp_config_init() -> *mut Config {
+    let mut config = match Config::new(QUICHE_PROTOCOL_VERSION) {
+        Ok(c) => Box::new(c),
+
+        Err(e) => {
+            eprintln!("failed to create config {:?}", e);
+            return std::ptr::null_mut();
+        }
+    };
+
+    match config.load_cert_chain_from_pem_file("./cert.crt") {
+        Ok(_) => (),
+        Err(e) => {
+            eprintln!("failed to read cert.crt {:?}", e);
+            return std::ptr::null_mut();
+        }
+    };
+
+    match config.load_priv_key_from_pem_file("./cert.key") {
+        Ok(_) => (),
+        Err(e) => {
+            eprintln!("failed to read cert.key {:?}", e);
+            return std::ptr::null_mut();
+        }
+    };
+
+    if let Err(e) = config.set_application_protos(b"\x05hq-28\x05hq-27\x08http/0.9") {
+        eprintln!("failed to set application protocols {:?}", e);
+        return std::ptr::null_mut();
+    };
+
+    config.set_max_idle_timeout(1000);
+    config.set_initial_max_data(0xffffffff);
+    config.set_initial_max_stream_data_bidi_local(0xffffffff);
+    config.set_initial_max_stream_data_bidi_remote(0xffffffff);
+    config.set_initial_max_streams_bidi(0xffffffff);
+    config.set_cc_algorithm(quiche::CongestionControlAlgorithm::Reno);
+    config.set_disable_active_migration(true);
+    // quiche_config_set_max_packet_size(config, MAX_DATAGRAM_SIZE);
+
+    if let Ok(_) = std::env::var("SSLKEYLOGFILE") {
+        config.log_keys();
+    }
+
+    return Box::into_raw(config);
+}
 
 /*
 创建套接字
@@ -52,18 +99,18 @@ fn error_to_c(e: Error) -> libc::ssize_t {
 成功返回>0的sock，失败返回-1
 */
 #[no_mangle]
-pub extern fn dtp_socket() -> c_int {
+pub extern "C" fn dtp_socket() -> c_int {
     return -1;
 }
 
 /**
  * @brief 在调用 dtp_socket 之后发生其他的意外时进行调用，关闭 dtp_socket
- * 
- * @param sock 
+ *
+ * @param sock
  * @return int =0 成功，其他都是失败
  */
 #[no_mangle]
-pub extern fn dtp_socket_close(sock: c_int) -> c_int {
+pub extern "C" fn dtp_socket_close(sock: c_int) -> c_int {
     return -1;
 }
 
@@ -73,8 +120,7 @@ pub extern fn dtp_socket_close(sock: c_int) -> c_int {
 成功返回1，失败返回-1
 */
 #[no_mangle]
-pub extern fn dtp_bind(sock: c_int, ip: *const c_char, port: c_int) 
-->c_int {
+pub extern "C" fn dtp_bind(sock: c_int, ip: *const c_char, port: c_int) -> c_int {
     return -1;
 }
 
@@ -85,9 +131,8 @@ pub extern fn dtp_bind(sock: c_int, ip: *const c_char, port: c_int)
 成功返回一个会话地址，失败返回NULL
 */
 #[no_mangle]
-pub extern fn dtp_listen(sock: c_int, config :*mut Config)
-->*mut DtpServer {
-    return Box::into_raw(Box::new(DtpServer::default()));
+pub extern "C" fn dtp_listen(sock: c_int, config: *mut Config) -> *mut DtpServer {
+    return std::ptr::null_mut();
 }
 
 /*
@@ -96,9 +141,12 @@ is_block：是否阻塞；false = 非阻塞
 成功返回一个地址，失败返回NULL
 */
 #[no_mangle]
-pub extern fn dtp_accept(sock: c_int, config :*mut Config, is_block: c_bool)
-->*mut DtpConnection {
-    return Box::into_raw(Box::new(DtpConnection::default()));
+pub extern "C" fn dtp_accept(
+    sock: c_int,
+    config: *mut Config,
+    is_block: c_bool,
+) -> *mut DtpConnection {
+    return std::ptr::null_mut();
 }
 
 /*
@@ -106,8 +154,12 @@ pub extern fn dtp_accept(sock: c_int, config :*mut Config, is_block: c_bool)
 成功返回地址，失败返回NULL
 */
 #[no_mangle]
-pub extern fn dtp_connect(sock: c_int, ip: *const c_char, port: c_int, config :*mut Config)
-->*mut DtpConnection {
+pub extern "C" fn dtp_connect(
+    sock: c_int,
+    ip: *const c_char,
+    port: c_int,
+    config: *mut Config,
+) -> *mut DtpConnection {
     return Box::into_raw(Box::new(DtpConnection::default()));
 }
 
@@ -118,12 +170,13 @@ pub extern fn dtp_connect(sock: c_int, ip: *const c_char, port: c_int, config :*
 当返回-1的时候，建议对链接判断是否关闭。
 */
 #[no_mangle]
-pub extern fn dtp_recv(
-    conns: *mut DtpConnection, 
-    buf: *mut u8, buflen: c_int, 
-    stream_id: *mut c_int, 
-    fin: *mut c_bool)
--> c_int {
+pub extern "C" fn dtp_recv(
+    conns: *mut DtpConnection,
+    buf: *mut u8,
+    buflen: c_int,
+    stream_id: *mut c_int,
+    fin: *mut c_bool,
+) -> c_int {
     return -1;
 }
 /*
@@ -136,10 +189,13 @@ pub extern fn dtp_recv(
 fin：发送端使用，标识这个流的数据传输完成。同理接收端使用这个标识符来判断一个流是否结束。
 */
 #[no_mangle]
-pub extern fn dtp_send(conns: *mut DtpConnection, 
-    buf: *const u8, buflen: c_int, 
-    fin: c_bool, stream_id: c_int)
--> c_int {
+pub extern "C" fn dtp_send(
+    conns: *mut DtpConnection,
+    buf: *const u8,
+    buflen: c_int,
+    fin: c_bool,
+    stream_id: c_int,
+) -> c_int {
     return -1;
 }
 // int dtp_send_with_priority(struct conn_io *conn_io, char *buf, int buflen, bool fin,
@@ -149,8 +205,7 @@ pub extern fn dtp_send(conns: *mut DtpConnection,
 这个与下面dtp_close_connections的区别是，这个只会关闭单个链接
 */
 #[no_mangle]
-pub extern fn dtp_close(conns: *mut DtpConnection)
--> c_int {
+pub extern "C" fn dtp_close(conns: *mut DtpConnection) -> c_int {
     return -1;
 }
 
@@ -160,8 +215,7 @@ pub extern fn dtp_close(conns: *mut DtpConnection)
 这个和上一个的区别是，使用这个会关闭当前所有的链接，不管是否建立链接。
 */
 #[no_mangle]
-pub extern fn dtp_close_connections(conns: *mut DtpServer)
--> c_int {
+pub extern "C" fn dtp_close_connections(conns: *mut DtpServer) -> c_int {
     return -1;
 }
 
@@ -171,8 +225,7 @@ pub extern fn dtp_close_connections(conns: *mut DtpServer)
 成功返回>0,失败返回-1
 */
 #[no_mangle]
-pub extern fn dtp_get_conns_listenfd(conns: *mut DtpServer)
--> c_int {
+pub extern "C" fn dtp_get_conns_listenfd(conns: *mut DtpServer) -> c_int {
     return -1;
 }
 
@@ -182,8 +235,7 @@ pub extern fn dtp_get_conns_listenfd(conns: *mut DtpServer)
 ！！！这两个函数只能用于判断是否有数据可读，不可以使用于判断是否可写。！！
 */
 #[no_mangle]
-pub extern fn dtp_get_connio_listenfd(conn_io: *mut DtpConnection)
--> c_int {
+pub extern "C" fn dtp_get_connio_listenfd(conn_io: *mut DtpConnection) -> c_int {
     return -1;
 }
 
@@ -192,16 +244,17 @@ pub extern fn dtp_get_connio_listenfd(conn_io: *mut DtpConnection)
 关闭了返回1.错误返回-1
 */
 #[no_mangle]
-pub extern fn dtp_connect_is_close(conn_io: *mut DtpConnection)
--> c_int {
+pub extern "C" fn dtp_connect_is_close(conn_io: *mut DtpConnection) -> c_int {
     return -1;
 }
 
 //--------参数配置------------------
 // Configures the given certificate chain.
 #[no_mangle]
-pub extern fn dtp_config_load_cert_chain_from_pem_file(config: *mut Config, path: *const c_char)
--> c_int {
+pub extern "C" fn dtp_config_load_cert_chain_from_pem_file(
+    config: *mut Config,
+    path: *const c_char,
+) -> c_int {
     if config.is_null() {
         eprintln!("some input args are null");
         return -1;
@@ -215,39 +268,40 @@ pub extern fn dtp_config_load_cert_chain_from_pem_file(config: *mut Config, path
             Ok(_) => 0,
 
             Err(e) => error_to_c(e) as c_int,
-        }
+        };
     }
 }
 
 // Configures the given private key.
 #[no_mangle]
-pub extern fn dtp_config_load_priv_key_from_pem_file(config: *mut Config, path: *const c_char)
--> c_int {
+pub extern "C" fn dtp_config_load_priv_key_from_pem_file(
+    config: *mut Config,
+    path: *const c_char,
+) -> c_int {
     if config.is_null() {
         eprintln!("some input args are null");
         return -1;
     }
     let path = unsafe { ffi::CStr::from_ptr(path).to_str().unwrap() };
 
-    unsafe { 
+    unsafe {
         let config = &mut *config;
         return match config.load_priv_key_from_pem_file(path) {
             Ok(_) => 0,
 
             Err(e) => error_to_c(e) as c_int,
-        }
+        };
     };
 }
 
 // Sets the `max_idle_timeout` transport parameter.
 #[no_mangle]
-pub extern fn dtp_config_set_max_idle_timeout(config: *mut Config, v: u64)
--> c_int {
+pub extern "C" fn dtp_config_set_max_idle_timeout(config: *mut Config, v: u64) -> c_int {
     if config.is_null() {
         eprintln!("some input args are null");
         return -1;
     }
-    unsafe { 
+    unsafe {
         let config = &mut *config;
         config.set_max_idle_timeout(v);
         return 0;
@@ -255,13 +309,15 @@ pub extern fn dtp_config_set_max_idle_timeout(config: *mut Config, v: u64)
 }
 // Sets the `initial_max_stream_data_bidi_local` transport parameter.
 #[no_mangle]
-pub extern fn dtp_config_set_initial_max_stream_data_bidi_local(config: *mut Config, v: u64)
--> c_int {
+pub extern "C" fn dtp_config_set_initial_max_stream_data_bidi_local(
+    config: *mut Config,
+    v: u64,
+) -> c_int {
     if config.is_null() {
         eprintln!("some input args are null");
         return -1;
     }
-    unsafe { 
+    unsafe {
         let config = &mut *config;
         config.set_initial_max_stream_data_bidi_local(v);
         return 0;
@@ -270,14 +326,16 @@ pub extern fn dtp_config_set_initial_max_stream_data_bidi_local(config: *mut Con
 
 // Sets the `initial_max_stream_data_bidi_remote` transport parameter.
 #[no_mangle]
-pub extern fn dtp_config_set_initial_max_stream_data_bidi_remote(config: *mut Config, v: u64)
--> c_int {
+pub extern "C" fn dtp_config_set_initial_max_stream_data_bidi_remote(
+    config: *mut Config,
+    v: u64,
+) -> c_int {
     if config.is_null() {
         eprintln!("some input args are null");
         return -1;
     }
 
-    unsafe { 
+    unsafe {
         let config = &mut *config;
         config.set_initial_max_stream_data_bidi_remote(v);
         return 0;
@@ -286,13 +344,12 @@ pub extern fn dtp_config_set_initial_max_stream_data_bidi_remote(config: *mut Co
 
 // Sets the `initial_max_stream_data_uni` transport parameter.
 #[no_mangle]
-pub extern fn dtp_config_set_initial_max_stream_data_uni(config: *mut Config, v: u64)
--> c_int {
+pub extern "C" fn dtp_config_set_initial_max_stream_data_uni(config: *mut Config, v: u64) -> c_int {
     if config.is_null() {
         eprintln!("some input args are null");
         return -1;
     }
-    unsafe { 
+    unsafe {
         let config = &mut *config;
         config.set_initial_max_stream_data_uni(v);
         return 0;
@@ -301,13 +358,12 @@ pub extern fn dtp_config_set_initial_max_stream_data_uni(config: *mut Config, v:
 
 // Sets the `initial_max_streams_bidi` transport parameter.
 #[no_mangle]
-pub extern fn dtp_config_set_initial_max_streams_bidi(config: *mut Config, v: u64)
--> c_int {
+pub extern "C" fn dtp_config_set_initial_max_streams_bidi(config: *mut Config, v: u64) -> c_int {
     if config.is_null() {
         eprintln!("some input args are null");
         return -1;
     }
-    unsafe { 
+    unsafe {
         let config = &mut *config;
         config.set_initial_max_streams_bidi(v);
         return 0;
@@ -316,13 +372,12 @@ pub extern fn dtp_config_set_initial_max_streams_bidi(config: *mut Config, v: u6
 
 // Sets the `initial_max_streams_uni` transport parameter.
 #[no_mangle]
-pub extern fn dtp_config_set_initial_max_streams_uni(config: *mut Config, v: u64) 
--> c_int {
+pub extern "C" fn dtp_config_set_initial_max_streams_uni(config: *mut Config, v: u64) -> c_int {
     if config.is_null() {
         eprintln!("some input args are null");
         return -1;
     }
-    unsafe { 
+    unsafe {
         let config = &mut *config;
         config.set_initial_max_streams_uni(v);
         return 0;
@@ -331,12 +386,11 @@ pub extern fn dtp_config_set_initial_max_streams_uni(config: *mut Config, v: u64
 
 #[no_mangle]
 //打开或者关闭国密
-pub extern fn dtp_config_set_gmssl_key(config: *mut Config, v: u64) 
--> c_int {
+pub extern "C" fn dtp_config_set_gmssl_key(config: *mut Config, v: u64) -> c_int {
     if config.is_null() {
         return -1;
     }
-    unsafe { 
+    unsafe {
         let config = &mut *config;
         config.set_gmssl(v);
         return 0;
