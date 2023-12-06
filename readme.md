@@ -8,3 +8,9 @@
 `cargo build --release`
 
 在 target/release 中找到 libnanwei_api_rust.so
+
+## 运行测试样例测试程序
+
+`cargo run --release > client.log`
+
+应该可以在 client.log 程序中看到不断产生的 log 信息，大概一秒钟产生 30 个，一共产生 500 个

@@ -1,9 +1,10 @@
+use libc::c_int;
 use mio::net::UdpSocket;
 use quiche::{Config, Connection};
-use std::sync::{Arc, Mutex};
-use std::net::SocketAddr;
 use ring::rand::*;
-use anyhow::anyhow;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+
 use anyhow::Result;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
@@ -22,11 +23,12 @@ fn hex_dump(buf: &[u8]) -> String {
 
 fn client_loop(
     poll: Arc<Mutex<mio::Poll>>,
-    events: Arc<Mutex<mio::Events>>, 
+    events: Arc<Mutex<mio::Events>>,
     conn: Arc<Mutex<Connection>>,
     socket: Arc<Mutex<UdpSocket>>,
     peer_addr: SocketAddr,
-    id: i32) -> Result<()> {
+    id: i32,
+) -> Result<()> {
     let mut buf = [0; 65535];
     let mut out = [0; MAX_DATAGRAM_SIZE];
 
@@ -174,40 +176,31 @@ fn client_loop(
 #[repr(C)]
 #[derive(Default)]
 pub struct DtpClient {
-    conn: Option<Arc<Mutex<Connection>>>,    // 在客户端调用函数 connect 之后获得
-    socket: Option<Arc<Mutex<UdpSocket>>>,
+    conn: Option<Arc<Mutex<Connection>>>, // 在客户端调用函数 connect 之后获得
+    pub socket: Option<Arc<Mutex<UdpSocket>>>,
     peer_addr: Option<SocketAddr>,
-    poll: Option<Arc<Mutex<mio::Poll>>>,     // 注册 socket 之后只在 client 循环中被引用
+    poll: Option<Arc<Mutex<mio::Poll>>>, // 注册 socket 之后只在 client 循环中被引用
     events: Option<Arc<Mutex<mio::Events>>>, // 只会在 client_loop 中被引用
+    sockid: Option<c_int>,
 }
 
 impl DtpClient {
     /// 在 connect 之后运行，持续运行
-    pub fn run(&mut self, id: i32) {
+    pub fn run(&self, id: i32) {
         let p = self.poll.clone().unwrap().clone();
         let e = self.events.clone().unwrap().clone();
         let c = self.conn.clone().unwrap().clone();
         let s = self.socket.clone().unwrap().clone();
         let peer = self.peer_addr.unwrap().clone();
         let h = std::thread::spawn(move || {
-            client_loop(
-                p,
-                e,
-                c,
-                s,
-                peer,
-                id
-            ).unwrap();
+            client_loop(p, e, c, s, peer, id).unwrap();
         });
         h.join().unwrap();
     }
 
     /// 在 bind 之后调用，进行连接
     /// 可以使用这个函数直接返回一个 DtpClient
-    pub fn connect(
-        ip: String, port: i32, 
-        config: &mut Config
-    ) -> Result<DtpClient> {
+    pub fn connect(ip: String, port: i32, config: &mut Config, sockid: c_int) -> Result<DtpClient> {
         // Setup the event loop.
         let poll = mio::Poll::new().unwrap();
         let events = mio::Events::with_capacity(2048);
@@ -223,12 +216,11 @@ impl DtpClient {
 
         // Create the UDP socket backing the QUIC connection, and register it with
         // the event loop.
-        let mut socket =
-            mio::net::UdpSocket::bind(bind_addr.parse()?)?;
+        let mut socket = mio::net::UdpSocket::bind(bind_addr.parse()?)?;
 
         poll.registry()
-        .register(&mut socket, mio::Token(0), mio::Interest::READABLE)
-        .unwrap();
+            .register(&mut socket, mio::Token(0), mio::Interest::READABLE)
+            .unwrap();
 
         let socket_arc = Some(Arc::new(Mutex::new(socket)));
 
@@ -270,14 +262,13 @@ impl DtpClient {
 
         debug!("written {}", write);
 
-        Ok(
-            DtpClient { 
-                conn: Some(Arc::new(Mutex::new(conn))),
-                socket: socket_arc, 
-                peer_addr: Some(peer_addr), 
-                poll: Some(Arc::new(Mutex::new(poll))), 
-                events: Some(Arc::new(Mutex::new(events)))
-            }
-        )
+        Ok(DtpClient {
+            conn: Some(Arc::new(Mutex::new(conn))),
+            socket: socket_arc,
+            peer_addr: Some(peer_addr),
+            poll: Some(Arc::new(Mutex::new(poll))),
+            events: Some(Arc::new(Mutex::new(events))),
+            sockid: Some(sockid),
+        })
     }
 }

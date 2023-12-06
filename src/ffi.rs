@@ -1,25 +1,17 @@
 use libc::c_char;
 use libc::c_int;
-use libc::c_void;
-use libc::size_t;
-use libc::sockaddr;
-use libc::ssize_t;
-use libc::timespec;
-use std::error;
+
 use std::ffi;
 
+use crate::client::DtpClient;
+use crate::server::DtpServer;
+use crate::DTP_API_MAP;
+use crate::{DtpConnection, DtpServerConns};
 use quiche::Config;
 use quiche::Error;
+use std::sync::{Arc, Mutex};
 
 type c_bool = bool;
-
-#[repr(C)]
-#[derive(Default, Debug, Copy, Clone)]
-pub struct DtpConnection {}
-
-#[repr(C)]
-#[derive(Default, Debug, Copy, Clone)]
-pub struct DtpServer {}
 
 fn error_to_c(e: Error) -> libc::ssize_t {
     match e {
@@ -44,14 +36,14 @@ fn error_to_c(e: Error) -> libc::ssize_t {
 const QUICHE_PROTOCOL_VERSION: u32 = 0x00000001;
 
 //----------API接口函数声明---------
-//生成默认的 客户端和服务端的配置文件
+//生成默认的客户端和服务端的配置文件
 #[no_mangle]
 pub extern "C" fn dtp_config_init() -> *mut Config {
     let mut config = match Config::new(QUICHE_PROTOCOL_VERSION) {
         Ok(c) => Box::new(c),
 
         Err(e) => {
-            eprintln!("failed to create config {:?}", e);
+            error!("failed to create config {:?}", e);
             return std::ptr::null_mut();
         }
     };
@@ -59,7 +51,7 @@ pub extern "C" fn dtp_config_init() -> *mut Config {
     match config.load_cert_chain_from_pem_file("./cert.crt") {
         Ok(_) => (),
         Err(e) => {
-            eprintln!("failed to read cert.crt {:?}", e);
+            error!("failed to read cert.crt {:?}", e);
             return std::ptr::null_mut();
         }
     };
@@ -67,17 +59,17 @@ pub extern "C" fn dtp_config_init() -> *mut Config {
     match config.load_priv_key_from_pem_file("./cert.key") {
         Ok(_) => (),
         Err(e) => {
-            eprintln!("failed to read cert.key {:?}", e);
+            error!("failed to read cert.key {:?}", e);
             return std::ptr::null_mut();
         }
     };
 
     if let Err(e) = config.set_application_protos(b"\x05hq-28\x05hq-27\x08http/0.9") {
-        eprintln!("failed to set application protocols {:?}", e);
+        error!("failed to set application protocols {:?}", e);
         return std::ptr::null_mut();
     };
 
-    config.set_max_idle_timeout(1000);
+    config.set_max_idle_timeout(1000000); // 设置一个超长的超时时间，防止极长的数据处理时间带来不可预测的结果
     config.set_initial_max_data(0xffffffff);
     config.set_initial_max_stream_data_bidi_local(0xffffffff);
     config.set_initial_max_stream_data_bidi_remote(0xffffffff);
@@ -100,7 +92,7 @@ pub extern "C" fn dtp_config_init() -> *mut Config {
 */
 #[no_mangle]
 pub extern "C" fn dtp_socket() -> c_int {
-    return -1;
+    return DTP_API_MAP.lock().unwrap().create_udp_fd();
 }
 
 /**
@@ -111,17 +103,56 @@ pub extern "C" fn dtp_socket() -> c_int {
  */
 #[no_mangle]
 pub extern "C" fn dtp_socket_close(sock: c_int) -> c_int {
-    return -1;
+    let mut api_map = DTP_API_MAP.lock().unwrap();
+    if api_map.sock_map.get(&sock).is_none() {
+        error!("failed to close dtp_socket: no such sock, {}", sock);
+        return -1;
+    }
+    if api_map.client_map.get(&sock).is_some() {
+        error!("failed to close dtp_socket: sock in use (client), {}", sock);
+        return -1;
+    }
+    if api_map.server_map.get(&sock).is_some() {
+        error!("failed to close dtp_socket: sock in use (server), {}", sock);
+        return -1;
+    }
+    api_map.sock_map.remove(&sock);
+    return 0;
 }
 
 /*
 绑定端口
 给套接字绑定一个地址；和tcp中的bind无异
 成功返回1，失败返回-1
+只有 server 会调用这个函数
 */
 #[no_mangle]
 pub extern "C" fn dtp_bind(sock: c_int, ip: *const c_char, port: c_int) -> c_int {
-    return -1;
+    let mut api_map = DTP_API_MAP.lock().unwrap();
+
+    if !api_map.has_sock_entry(sock) {
+        error!("error in dtp_bind: no such sock {}", sock);
+        return -1;
+    }
+    if api_map.has_server(sock) {
+        error!("error in dtp_bind: sock {} already binded", sock);
+        return -1;
+    }
+
+    let ip = unsafe { ffi::CStr::from_ptr(ip).to_str().unwrap() };
+    let server = match DtpServer::bind(ip.to_owned(), port, sock) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("error in dtp_bind: {:?}", e);
+            return -1;
+        }
+    };
+
+    api_map.sock_map.insert(sock, server.socket.clone());
+    api_map
+        .server_map
+        .insert(sock, Arc::new(Mutex::new(server)));
+    return 1;
 }
 
 /*
@@ -129,22 +160,57 @@ pub extern "C" fn dtp_bind(sock: c_int, ip: *const c_char, port: c_int) -> c_int
 设置监听端口
 非阻塞
 成功返回一个会话地址，失败返回NULL
+只有 server 会调用这个函数
 */
 #[no_mangle]
-pub extern "C" fn dtp_listen(sock: c_int, config: *mut Config) -> *mut DtpServer {
-    return std::ptr::null_mut();
+pub extern "C" fn dtp_listen(sock: c_int, config: *mut Config) -> *mut DtpServerConns {
+    let mut api_map = DTP_API_MAP.lock().unwrap();
+    if !api_map.has_sock_entry(sock) {
+        error!("error in dtp_listen: no such sock {}", sock);
+        return std::ptr::null_mut();
+    } else if !api_map.has_server(sock) {
+        error!("error in dtp_listen: sock {} not binded", sock);
+        return std::ptr::null_mut();
+    }
+    // 在 dtp_bind 的基础上为 DtpServer 赋予 config 的值
+    // 之后该结构体就可以运行 run 函数
+    let server_arc = {
+        if let Some(s) = api_map.server_map.get_mut(&sock) {
+            let config = unsafe { Box::from_raw(config) };
+            let config = Arc::new(Mutex::new(*config));
+            s.lock().unwrap().config = Some(config);
+            s.clone()
+        } else {
+            error!("error in dtp_listen: sock is not binded, {}", sock);
+            return std::ptr::null_mut();
+        }
+    };
+    // TODO: 使用线程来运行 DtpServer 以及相关的程序
+    let c = server_arc.clone();
+    let h = std::thread::spawn(move || {
+        c.lock().unwrap().run();
+    });
+    // api_map.server_handles.insert(sock, h);
+
+    let conns = DtpServerConns {
+        server: Some(server_arc.clone()),
+        handle: Some(h),
+    };
+
+    return Box::into_raw(Box::new(conns));
 }
 
 /*
 接受链接
 is_block：是否阻塞；false = 非阻塞
 成功返回一个地址，失败返回NULL
+只有 server 会调用这个函数
 */
 #[no_mangle]
 pub extern "C" fn dtp_accept(
-    sock: c_int,
-    config: *mut Config,
-    is_block: c_bool,
+    _sock: c_int,
+    _config: *mut Config,
+    _is_block: c_bool,
 ) -> *mut DtpConnection {
     return std::ptr::null_mut();
 }
@@ -152,6 +218,7 @@ pub extern "C" fn dtp_accept(
 /*
 发起连接
 成功返回地址，失败返回NULL
+只有 client 会调用这个函数
 */
 #[no_mangle]
 pub extern "C" fn dtp_connect(
@@ -160,7 +227,41 @@ pub extern "C" fn dtp_connect(
     port: c_int,
     config: *mut Config,
 ) -> *mut DtpConnection {
-    return Box::into_raw(Box::new(DtpConnection::default()));
+    let mut api_map = DTP_API_MAP.lock().unwrap();
+    if !api_map.has_sock_entry(sock) {
+        error!("error in dtp_connect: no such sock {}", sock);
+        return std::ptr::null_mut();
+    }
+    if api_map.has_client(sock) {
+        error!("error in dtp_connect: sock {} already connected", sock);
+        return std::ptr::null_mut();
+    }
+    let ip = unsafe { ffi::CStr::from_ptr(ip).to_str().unwrap() };
+    let mut config = unsafe { Box::from_raw(config) };
+    let client = DtpClient::connect(ip.to_owned(), port, config.as_mut(), sock).unwrap();
+
+    api_map.sock_map.insert(sock, client.socket.clone());
+
+    let client_arc = Arc::new(Mutex::new(client));
+
+    let c = client_arc.clone();
+
+    api_map.sock_map.get_mut(&sock).as_mut();
+    api_map.client_map.insert(sock, client_arc.clone());
+
+    // TODO: 运行 client 的线程
+    let h = std::thread::spawn(move || {
+        c.lock().unwrap().run(sock);
+    });
+
+    // api_map.client_handles.insert(sock, h);
+
+    let conn_io = DtpConnection {
+        client: Some(client_arc.clone()),
+        handle: Some(h),
+    };
+
+    return Box::into_raw(Box::new(conn_io));
 }
 
 /*
@@ -171,11 +272,11 @@ pub extern "C" fn dtp_connect(
 */
 #[no_mangle]
 pub extern "C" fn dtp_recv(
-    conns: *mut DtpConnection,
-    buf: *mut u8,
-    buflen: c_int,
-    stream_id: *mut c_int,
-    fin: *mut c_bool,
+    _conns: *mut DtpConnection,
+    _buf: *mut u8,
+    _buflen: c_int,
+    _stream_id: *mut c_int,
+    _fin: *mut c_bool,
 ) -> c_int {
     return -1;
 }
@@ -190,11 +291,11 @@ fin：发送端使用，标识这个流的数据传输完成。同理接收端�
 */
 #[no_mangle]
 pub extern "C" fn dtp_send(
-    conns: *mut DtpConnection,
-    buf: *const u8,
-    buflen: c_int,
-    fin: c_bool,
-    stream_id: c_int,
+    _conns: *mut DtpConnection,
+    _buf: *const u8,
+    _buflen: c_int,
+    _fin: c_bool,
+    _stream_id: c_int,
 ) -> c_int {
     return -1;
 }
@@ -205,7 +306,7 @@ pub extern "C" fn dtp_send(
 这个与下面dtp_close_connections的区别是，这个只会关闭单个链接
 */
 #[no_mangle]
-pub extern "C" fn dtp_close(conns: *mut DtpConnection) -> c_int {
+pub extern "C" fn dtp_close(_conns: *mut DtpConnection) -> c_int {
     return -1;
 }
 
@@ -215,7 +316,7 @@ pub extern "C" fn dtp_close(conns: *mut DtpConnection) -> c_int {
 这个和上一个的区别是，使用这个会关闭当前所有的链接，不管是否建立链接。
 */
 #[no_mangle]
-pub extern "C" fn dtp_close_connections(conns: *mut DtpServer) -> c_int {
+pub extern "C" fn dtp_close_connections(_conns: *mut DtpServerConns) -> c_int {
     return -1;
 }
 
@@ -225,7 +326,7 @@ pub extern "C" fn dtp_close_connections(conns: *mut DtpServer) -> c_int {
 成功返回>0,失败返回-1
 */
 #[no_mangle]
-pub extern "C" fn dtp_get_conns_listenfd(conns: *mut DtpServer) -> c_int {
+pub extern "C" fn dtp_get_conns_listenfd(_conns: *mut DtpServerConns) -> c_int {
     return -1;
 }
 
@@ -235,7 +336,7 @@ pub extern "C" fn dtp_get_conns_listenfd(conns: *mut DtpServer) -> c_int {
 ！！！这两个函数只能用于判断是否有数据可读，不可以使用于判断是否可写。！！
 */
 #[no_mangle]
-pub extern "C" fn dtp_get_connio_listenfd(conn_io: *mut DtpConnection) -> c_int {
+pub extern "C" fn dtp_get_connio_listenfd(_conn_io: *mut DtpConnection) -> c_int {
     return -1;
 }
 
@@ -244,7 +345,7 @@ pub extern "C" fn dtp_get_connio_listenfd(conn_io: *mut DtpConnection) -> c_int 
 关闭了返回1.错误返回-1
 */
 #[no_mangle]
-pub extern "C" fn dtp_connect_is_close(conn_io: *mut DtpConnection) -> c_int {
+pub extern "C" fn dtp_connect_is_close(_conn_io: *mut DtpConnection) -> c_int {
     return -1;
 }
 

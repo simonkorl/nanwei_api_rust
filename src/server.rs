@@ -1,15 +1,16 @@
-use std::net;
-use std::collections::HashMap;
-use mio::net::UdpSocket;
-use ring::rand::*;
-use std::sync::{Mutex, Arc};
-use quiche::Config;
 use anyhow::Result;
+use libc::c_int;
+use mio::net::UdpSocket;
+use quiche::Config;
+use ring::rand::*;
+use std::collections::HashMap;
+use std::net;
+use std::sync::{Arc, Mutex};
 
 extern crate serde;
 extern crate serde_json;
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
@@ -33,12 +34,12 @@ struct ClientRequest {
     client_id: i32,
 }
 
-fn server_loop (
+fn server_loop(
     clients: Arc<Mutex<ClientMap>>,
     poll: Arc<Mutex<mio::Poll>>,
     events: Arc<Mutex<mio::Events>>,
     socket: Arc<Mutex<UdpSocket>>,
-    config: Arc<Mutex<Config>>
+    config: Arc<Mutex<Config>>,
 ) -> Result<()> {
     let mut buf = [0; 65535];
     let mut out = [0; MAX_DATAGRAM_SIZE];
@@ -47,8 +48,7 @@ fn server_loop (
     let mut events = events.lock().unwrap();
 
     let rng = SystemRandom::new();
-    let conn_id_seed =
-        ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng).unwrap();
+    let conn_id_seed = ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng).unwrap();
 
     let waker = Arc::new(mio::Waker::new(poll.registry(), mio::Token(10)).unwrap());
 
@@ -56,11 +56,13 @@ fn server_loop (
         // Find the shorter timeout from all the active connections.
         //
         // TODO: use event loop that properly supports timers
-        let timeout = clients.lock().unwrap().values().filter_map(|c| c.lock().unwrap().conn.timeout()).min();
-        debug!(
-            "get timeout {:?}",
-            timeout
-        );
+        let timeout = clients
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|c| c.lock().unwrap().conn.timeout())
+            .min();
+        debug!("get timeout {:?}", timeout);
         poll.poll(&mut events, timeout).unwrap();
 
         let socket = socket.lock().unwrap();
@@ -74,7 +76,11 @@ fn server_loop (
             if events.is_empty() {
                 debug!("timed out");
 
-                clients.lock().unwrap().values_mut().for_each(|c| c.lock().unwrap().conn.on_timeout());
+                clients
+                    .lock()
+                    .unwrap()
+                    .values_mut()
+                    .for_each(|c| c.lock().unwrap().conn.on_timeout());
 
                 break 'read;
             }
@@ -91,7 +97,7 @@ fn server_loop (
                     }
 
                     panic!("recv() failed: {:?}", e);
-                },
+                }
             };
 
             debug!("got {} bytes", len);
@@ -99,16 +105,13 @@ fn server_loop (
             let pkt_buf = &mut buf[..len];
 
             // Parse the QUIC packet's header.
-            let hdr = match quiche::Header::from_slice(
-                pkt_buf,
-                quiche::MAX_CONN_ID_LEN,
-            ) {
+            let hdr = match quiche::Header::from_slice(pkt_buf, quiche::MAX_CONN_ID_LEN) {
                 Ok(v) => v,
 
                 Err(e) => {
                     error!("Parsing packet header failed: {:?}", e);
                     continue 'read;
-                },
+                }
             };
 
             trace!("got packet {:?}", hdr);
@@ -120,8 +123,8 @@ fn server_loop (
             // Lookup a connection based on the packet's connection ID. If there
             // is no connection matching, create a new one.
             let mut clients_lock = clients.lock().unwrap();
-            let client = if !clients_lock.contains_key(&hdr.dcid) &&
-                !clients_lock.contains_key(&conn_id)
+            let client = if !clients_lock.contains_key(&hdr.dcid)
+                && !clients_lock.contains_key(&conn_id)
             {
                 if hdr.ty != quiche::Type::Initial {
                     error!("Packet is not Initial");
@@ -131,9 +134,7 @@ fn server_loop (
                 if !quiche::version_is_supported(hdr.version) {
                     warn!("Doing version negotiation");
 
-                    let len =
-                        quiche::negotiate_version(&hdr.scid, &hdr.dcid, &mut out)
-                            .unwrap();
+                    let len = quiche::negotiate_version(&hdr.scid, &hdr.dcid, &mut out).unwrap();
 
                     let out = &out[..len];
 
@@ -241,14 +242,24 @@ fn server_loop (
                 Ok(v) => v,
 
                 Err(e) => {
-                    error!("{} recv failed: {:?}", client.lock().unwrap().conn.trace_id(), e);
+                    error!(
+                        "{} recv failed: {:?}",
+                        client.lock().unwrap().conn.trace_id(),
+                        e
+                    );
                     continue 'read;
-                },
+                }
             };
 
-            debug!("{} processed {} bytes", client.lock().unwrap().conn.trace_id(), read);
+            debug!(
+                "{} processed {} bytes",
+                client.lock().unwrap().conn.trace_id(),
+                read
+            );
 
-            if client.lock().unwrap().conn.is_in_early_data() || client.lock().unwrap().conn.is_established() {
+            if client.lock().unwrap().conn.is_in_early_data()
+                || client.lock().unwrap().conn.is_established()
+            {
                 // Handle writable streams.
                 {
                     let mut client_lock = client.lock().unwrap();
@@ -261,14 +272,8 @@ fn server_loop (
                     let mut client_lock = client.lock().unwrap();
                     // Process all readable streams.
                     for s in client_lock.conn.readable() {
-                        while let Ok((read, fin)) =
-                        client_lock.conn.stream_recv(s, &mut buf)
-                        {
-                            debug!(
-                                "{} received {} bytes",
-                                client_lock.conn.trace_id(),
-                                read
-                            );
+                        while let Ok((read, fin)) = client_lock.conn.stream_recv(s, &mut buf) {
+                            debug!("{} received {} bytes", client_lock.conn.trace_id(), read);
 
                             let stream_buf = &buf[..read];
 
@@ -284,11 +289,17 @@ fn server_loop (
                             let async_buf = buf[..read].to_owned();
                             let waker_clone = waker.clone();
                             info!("before spawn {}", client_lock.conn.trace_id());
-                            
-                            std::thread::spawn(move ||{
+
+                            std::thread::spawn(move || {
                                 info!("inside spawn");
                                 info!("spawn for {}", a.clone().lock().unwrap().conn.trace_id());
-                                handle_stream(a, s, async_buf.as_slice(), "examples/root", waker_clone);
+                                handle_stream(
+                                    a,
+                                    s,
+                                    async_buf.as_slice(),
+                                    "examples/root",
+                                    waker_clone,
+                                );
                             });
                             // let h = tokio::spawn(async move {
                             //     info!("inside spawn");
@@ -314,14 +325,14 @@ fn server_loop (
                     Err(quiche::Error::Done) => {
                         debug!("{} done writing", client.conn.trace_id());
                         break;
-                    },
+                    }
 
                     Err(e) => {
                         error!("{} send failed: {:?}", client.conn.trace_id(), e);
 
                         client.conn.close(false, 0x1, b"fail").ok();
                         break;
-                    },
+                    }
                 };
 
                 if let Err(e) = socket.send_to(&out[..write], send_info.to) {
@@ -385,9 +396,7 @@ fn mint_token(hdr: &quiche::Header, src: &net::SocketAddr) -> Vec<u8> {
 ///
 /// Note that this function is only an example and doesn't do any cryptographic
 /// authenticate of the token. *It should not be used in production system*.
-fn validate_token<'a>(
-    src: &net::SocketAddr, token: &'a [u8],
-) -> Option<quiche::ConnectionId<'a>> {
+fn validate_token<'a>(src: &net::SocketAddr, token: &'a [u8]) -> Option<quiche::ConnectionId<'a>> {
     if token.len() < 6 {
         return None;
     }
@@ -412,7 +421,13 @@ fn validate_token<'a>(
 
 /// Handles incoming HTTP/0.9 requests.
 #[tokio::main]
-async fn handle_stream(client: Arc<Mutex<Client>>, stream_id: u64, buf: &[u8], root: &str, waker: Arc<mio::Waker>) {
+async fn handle_stream(
+    client: Arc<Mutex<Client>>,
+    stream_id: u64,
+    buf: &[u8],
+    _root: &str,
+    waker: Arc<mio::Waker>,
+) {
     // let conn = &mut client.conn;
 
     // if buf.len() > 4 && &buf[..4] == b"GET " {
@@ -463,33 +478,33 @@ async fn handle_stream(client: Arc<Mutex<Client>>, stream_id: u64, buf: &[u8], r
     // }
 
     let data = &buf[0..buf.len()];
-    let data = String::from_utf8(data.to_vec()).unwrap(); 
+    let data = String::from_utf8(data.to_vec()).unwrap();
 
     let req: ClientRequest = serde_json::from_str(data.as_str()).unwrap();
 
     info!(
-         "{} got request {} from id {:?} on stream {}",
-         client.lock().unwrap().conn.trace_id(),
-         data,
-         req.client_id,
-         stream_id
+        "{} got request {} from id {:?} on stream {}",
+        client.lock().unwrap().conn.trace_id(),
+        data,
+        req.client_id,
+        stream_id
     );
 
     // 模拟进行处理
     std::thread::sleep(std::time::Duration::from_secs_f64(1.0)); // 同步的线程阻塞
-    // tokio::time::sleep(std::time::Duration::from_secs_f64(0.5)).await; // 异步阻塞
+                                                                 // tokio::time::sleep(std::time::Duration::from_secs_f64(0.5)).await; // 异步阻塞
     let res = format!("收到：{}\n", data);
 
     info!(
-         "{} sending response of size {} on stream {}",
-         client.lock().unwrap().conn.trace_id(),
-         res.len(),
-         stream_id
+        "{} sending response of size {} on stream {}",
+        client.lock().unwrap().conn.trace_id(),
+        res.len(),
+        stream_id
     );
 
     let mut client_lock = client.lock();
     let client: &mut Client = client_lock.as_mut().unwrap();
-    let conn = &mut client.conn; 
+    let conn = &mut client.conn;
     let written = match conn.stream_send(stream_id, res.as_bytes(), true) {
         Ok(v) => v,
 
@@ -498,11 +513,14 @@ async fn handle_stream(client: Arc<Mutex<Client>>, stream_id: u64, buf: &[u8], r
         Err(e) => {
             error!("{} stream send failed {:?}", conn.trace_id(), e);
             return;
-        },
+        }
     };
 
     if written < res.len() {
-        let response = PartialResponse { body: res.as_bytes().to_owned(), written };
+        let response = PartialResponse {
+            body: res.as_bytes().to_owned(),
+            written,
+        };
         client.partial_responses.insert(stream_id, response);
     }
 
@@ -537,7 +555,7 @@ fn handle_writable(client: &mut Client, stream_id: u64) {
 
             error!("{} stream send failed {:?}", conn.trace_id(), e);
             return;
-        },
+        }
     };
 
     resp.written += written;
@@ -551,10 +569,11 @@ fn handle_writable(client: &mut Client, stream_id: u64) {
 #[derive(Default)]
 pub struct DtpServer {
     clients: Option<Arc<Mutex<ClientMap>>>,
-    socket: Option<Arc<Mutex<UdpSocket>>>,
-    poll: Option<Arc<Mutex<mio::Poll>>>,     // 注册 socket 之后只在 client 循环中被引用
+    pub socket: Option<Arc<Mutex<UdpSocket>>>,
+    poll: Option<Arc<Mutex<mio::Poll>>>, // 注册 socket 之后只在 client 循环中被引用
     events: Option<Arc<Mutex<mio::Events>>>, // 只会在 server_loop 中被引用
-    config: Option<Arc<Mutex<Config>>>
+    pub config: Option<Arc<Mutex<Config>>>,
+    sockid: Option<c_int>,
 }
 
 impl DtpServer {
@@ -564,21 +583,15 @@ impl DtpServer {
         let e = self.events.clone().unwrap().clone();
         let s = self.socket.clone().unwrap().clone();
         let c = self.config.clone().unwrap().clone();
-        let h = std::thread::spawn(move ||{
-            server_loop(
-                clients,
-                p,
-                e,
-                s,
-                c
-            ).unwrap();
+        let h = std::thread::spawn(move || {
+            server_loop(clients, p, e, s, c).unwrap();
         });
         h.join().unwrap();
     }
 
-    pub fn listen(ip: String, port: i32, 
-        config: Arc<Mutex<Config>>
-    ) -> Result<DtpServer> {
+    /// 根据目的地址创建一个 DtpServer
+    /// 其可以通过调用 run 来运行
+    pub fn listen(ip: String, port: i32, config: Arc<Mutex<Config>>) -> Result<DtpServer> {
         // Setup the event loop.
         let poll = mio::Poll::new()?;
         let events = mio::Events::with_capacity(2048);
@@ -586,8 +599,7 @@ impl DtpServer {
         let local_addr = format!("{}:{}", ip, port).parse()?;
 
         // Create the UDP listening socket, and register it with the event loop.
-        let mut socket =
-            mio::net::UdpSocket::bind(local_addr)?;
+        let mut socket = mio::net::UdpSocket::bind(local_addr)?;
 
         poll.registry()
             .register(&mut socket, mio::Token(0), mio::Interest::READABLE)?;
@@ -597,9 +609,38 @@ impl DtpServer {
         Ok(DtpServer {
             poll: Some(Arc::new(Mutex::new(poll))),
             events: Some(Arc::new(Mutex::new(events))),
-            clients:  Some(clients),
+            clients: Some(clients),
             socket: Some(Arc::new(Mutex::new(socket))),
-            config: Some(config)
+            config: Some(config),
+            sockid: None,
+        })
+    }
+
+    /// 根据目的地址创建一个 DtpServer
+    ///
+    /// 这个 server 没有 config，无法运行
+    pub fn bind(ip: String, port: i32, sockid: c_int) -> Result<DtpServer> {
+        // Setup the event loop.
+        let poll = mio::Poll::new()?;
+        let events = mio::Events::with_capacity(2048);
+
+        let local_addr = format!("{}:{}", ip, port).parse()?;
+
+        // Create the UDP listening socket, and register it with the event loop.
+        let mut socket = mio::net::UdpSocket::bind(local_addr)?;
+
+        poll.registry()
+            .register(&mut socket, mio::Token(0), mio::Interest::READABLE)?;
+
+        let clients = Arc::new(Mutex::new(ClientMap::new()));
+
+        Ok(DtpServer {
+            poll: Some(Arc::new(Mutex::new(poll))),
+            events: Some(Arc::new(Mutex::new(events))),
+            clients: Some(clients),
+            socket: Some(Arc::new(Mutex::new(socket))),
+            config: None,
+            sockid: Some(sockid),
         })
     }
 }
