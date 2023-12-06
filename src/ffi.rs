@@ -4,6 +4,7 @@ use libc::c_int;
 use std::ffi;
 
 use crate::client::DtpClient;
+use crate::message::*;
 use crate::server::DtpServer;
 use crate::DTP_API_MAP;
 use crate::{DtpConnection, DtpServerConns};
@@ -185,6 +186,7 @@ pub extern "C" fn dtp_listen(sock: c_int, config: *mut Config) -> *mut DtpServer
             return std::ptr::null_mut();
         }
     };
+    let waker = server_arc.clone().lock().unwrap().waker.clone();
     // TODO: 使用线程来运行 DtpServer 以及相关的程序
     let c = server_arc.clone();
     let h = std::thread::spawn(move || {
@@ -195,6 +197,7 @@ pub extern "C" fn dtp_listen(sock: c_int, config: *mut Config) -> *mut DtpServer
     let conns = DtpServerConns {
         server: Some(server_arc.clone()),
         handle: Some(h),
+        waker,
     };
 
     return Box::into_raw(Box::new(conns));
@@ -240,6 +243,9 @@ pub extern "C" fn dtp_connect(
     let mut config = unsafe { Box::from_raw(config) };
     let client = DtpClient::connect(ip.to_owned(), port, config.as_mut(), sock).unwrap();
 
+    let conn = client.conn.clone().unwrap();
+    let waker = client.waker.clone().unwrap();
+
     api_map.sock_map.insert(sock, client.socket.clone());
 
     let client_arc = Arc::new(Mutex::new(client));
@@ -252,6 +258,14 @@ pub extern "C" fn dtp_connect(
     // TODO: 运行 client 的线程
     let h = std::thread::spawn(move || {
         c.lock().unwrap().run(sock);
+        println!("client main loop stopped {}", sock);
+    });
+
+    let (tx, rx) = tokio::sync::mpsc::channel(32);
+
+    let hm = tokio::spawn(async move {
+        recv_msg_loop(rx, conn, waker).await;
+        println!("client msg loop finished {}", sock);
     });
 
     // api_map.client_handles.insert(sock, h);
@@ -259,6 +273,10 @@ pub extern "C" fn dtp_connect(
     let conn_io = DtpConnection {
         client: Some(client_arc.clone()),
         handle: Some(h),
+        msg_handle: Some(hm),
+        is_server_side: false,
+        tx: Some(tx),
+        sockid: sock,
     };
 
     return Box::into_raw(Box::new(conn_io));
@@ -306,8 +324,27 @@ pub extern "C" fn dtp_send(
 这个与下面dtp_close_connections的区别是，这个只会关闭单个链接
 */
 #[no_mangle]
-pub extern "C" fn dtp_close(_conns: *mut DtpConnection) -> c_int {
-    return -1;
+pub extern "C" fn dtp_close(conn_io: *mut DtpConnection) -> c_int {
+    if conn_io.is_null() {
+        error!("error in dtp_close: conn_io is null");
+        return -1;
+    }
+    // let conn_io = unsafe { Box::from_raw(conn_io) };
+
+    // if !conn_io.is_server_side && is_established
+    // connection close
+    // else if conn_io.is_server && !is closed
+    // debug!("can't close connection: client not finished")
+    // if is_server_side == false
+    // join client
+    // release resources
+    // else
+    // remove conn_io from hash_table at server_side
+    // release resources
+    // quiche_conn_free
+    // release pipe/channel
+    // release other pointer
+    return 1;
 }
 
 /*
@@ -342,11 +379,25 @@ pub extern "C" fn dtp_get_connio_listenfd(_conn_io: *mut DtpConnection) -> c_int
 
 /*
 用于判断当前的链接是否关闭
-关闭了返回1.错误返回-1
+关闭了返回1，没有关闭返回 0，错误返回-1
 */
 #[no_mangle]
-pub extern "C" fn dtp_connect_is_close(_conn_io: *mut DtpConnection) -> c_int {
-    return -1;
+pub extern "C" fn dtp_connect_is_close(conn_io: *mut DtpConnection) -> c_int {
+    if conn_io.is_null() {
+        return -1;
+    }
+    let conn_io = unsafe { Box::from_raw(conn_io) };
+    if let Some(client) = conn_io.client {
+        if let Some(conn) = client.lock().unwrap().conn.as_ref() {
+            return conn.lock().unwrap().is_closed() as c_int;
+        } else {
+            error!("error in dtp_connect_is_close: conn is None");
+            return -1;
+        }
+    } else {
+        error!("error in dtp_connect_is_close: client is None");
+        return -1;
+    }
 }
 
 //--------参数配置------------------

@@ -40,6 +40,7 @@ fn server_loop(
     events: Arc<Mutex<mio::Events>>,
     socket: Arc<Mutex<UdpSocket>>,
     config: Arc<Mutex<Config>>,
+    waker: Arc<Mutex<mio::Waker>>,
 ) -> Result<()> {
     let mut buf = [0; 65535];
     let mut out = [0; MAX_DATAGRAM_SIZE];
@@ -50,7 +51,7 @@ fn server_loop(
     let rng = SystemRandom::new();
     let conn_id_seed = ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng).unwrap();
 
-    let waker = Arc::new(mio::Waker::new(poll.registry(), mio::Token(10)).unwrap());
+    // let waker = Arc::new(mio::Waker::new(poll.registry(), mio::Token(10)).unwrap());
 
     loop {
         // Find the shorter timeout from all the active connections.
@@ -285,6 +286,17 @@ fn server_loop(
                                 fin
                             );
 
+                            if s != 4 {
+                                println!(
+                                    "{} stream {} has {} bytes (fin? {})",
+                                    client_lock.conn.trace_id(),
+                                    s,
+                                    stream_buf.len(),
+                                    fin
+                                );
+                                continue;
+                            }
+
                             let a = Arc::clone(client);
                             let async_buf = buf[..read].to_owned();
                             let waker_clone = waker.clone();
@@ -426,7 +438,7 @@ async fn handle_stream(
     stream_id: u64,
     buf: &[u8],
     _root: &str,
-    waker: Arc<mio::Waker>,
+    waker: Arc<Mutex<mio::Waker>>,
 ) {
     // let conn = &mut client.conn;
 
@@ -526,7 +538,7 @@ async fn handle_stream(
 
     // TODO: 创建事件，声明可以发送数据
     debug!("try to send in handle stream: {}", client.conn.trace_id());
-    waker.wake().expect("failed to wake");
+    waker.lock().unwrap().wake().expect("failed to wake");
 }
 
 /// Handles newly writable streams.
@@ -573,6 +585,7 @@ pub struct DtpServer {
     poll: Option<Arc<Mutex<mio::Poll>>>, // 注册 socket 之后只在 client 循环中被引用
     events: Option<Arc<Mutex<mio::Events>>>, // 只会在 server_loop 中被引用
     pub config: Option<Arc<Mutex<Config>>>,
+    pub waker: Option<Arc<Mutex<mio::Waker>>>,
     sockid: Option<c_int>,
 }
 
@@ -583,8 +596,9 @@ impl DtpServer {
         let e = self.events.clone().unwrap().clone();
         let s = self.socket.clone().unwrap().clone();
         let c = self.config.clone().unwrap().clone();
+        let w = self.waker.clone().unwrap().clone();
         let h = std::thread::spawn(move || {
-            server_loop(clients, p, e, s, c).unwrap();
+            server_loop(clients, p, e, s, c, w).unwrap();
         });
         h.join().unwrap();
     }
@@ -604,6 +618,8 @@ impl DtpServer {
         poll.registry()
             .register(&mut socket, mio::Token(0), mio::Interest::READABLE)?;
 
+        let waker = mio::Waker::new(poll.registry(), mio::Token(42)).unwrap();
+
         let clients = Arc::new(Mutex::new(ClientMap::new()));
 
         Ok(DtpServer {
@@ -613,6 +629,7 @@ impl DtpServer {
             socket: Some(Arc::new(Mutex::new(socket))),
             config: Some(config),
             sockid: None,
+            waker: Some(Arc::new(Mutex::new(waker))),
         })
     }
 
@@ -632,6 +649,8 @@ impl DtpServer {
         poll.registry()
             .register(&mut socket, mio::Token(0), mio::Interest::READABLE)?;
 
+        let waker = mio::Waker::new(poll.registry(), mio::Token(42)).unwrap();
+
         let clients = Arc::new(Mutex::new(ClientMap::new()));
 
         Ok(DtpServer {
@@ -641,6 +660,7 @@ impl DtpServer {
             socket: Some(Arc::new(Mutex::new(socket))),
             config: None,
             sockid: Some(sockid),
+            waker: Some(Arc::new(Mutex::new(waker))),
         })
     }
 }

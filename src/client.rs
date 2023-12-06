@@ -176,8 +176,9 @@ fn client_loop(
 #[repr(C)]
 #[derive(Default)]
 pub struct DtpClient {
-    conn: Option<Arc<Mutex<Connection>>>, // 在客户端调用函数 connect 之后获得
+    pub conn: Option<Arc<Mutex<Connection>>>, // 在客户端调用函数 connect 之后获得
     pub socket: Option<Arc<Mutex<UdpSocket>>>,
+    pub waker: Option<Arc<Mutex<mio::Waker>>>,
     peer_addr: Option<SocketAddr>,
     poll: Option<Arc<Mutex<mio::Poll>>>, // 注册 socket 之后只在 client 循环中被引用
     events: Option<Arc<Mutex<mio::Events>>>, // 只会在 client_loop 中被引用
@@ -221,6 +222,8 @@ impl DtpClient {
         poll.registry()
             .register(&mut socket, mio::Token(0), mio::Interest::READABLE)
             .unwrap();
+
+        let waker = mio::Waker::new(poll.registry(), mio::Token(42)).unwrap();
 
         let socket_arc = Some(Arc::new(Mutex::new(socket)));
 
@@ -269,6 +272,7 @@ impl DtpClient {
             poll: Some(Arc::new(Mutex::new(poll))),
             events: Some(Arc::new(Mutex::new(events))),
             sockid: Some(sockid),
+            waker: Some(Arc::new(Mutex::new(waker))),
         })
     }
 }

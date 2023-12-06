@@ -3,12 +3,15 @@ use lazy_static::lazy_static;
 use libc::c_int;
 use mio::net::UdpSocket;
 
+use std::sync::mpsc;
+
 use std::collections::HashMap;
 
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crate::client::DtpClient;
+use crate::message::DtpMsg;
 use crate::server::DtpServer;
 
 use anyhow::anyhow;
@@ -22,8 +25,12 @@ extern crate log;
 /// 模拟的 conn_io 结构体
 /// 其中的结构和之前实现的 conn_io 完全不同
 pub struct DtpConnection {
-    client: Option<Arc<Mutex<DtpClient>>>,
-    handle: Option<JoinHandle<()>>,
+    pub client: Option<Arc<Mutex<DtpClient>>>,
+    pub is_server_side: bool,
+    pub tx: Option<tokio::sync::mpsc::Sender<DtpMsg>>,
+    pub handle: Option<JoinHandle<()>>,
+    pub msg_handle: Option<tokio::task::JoinHandle<()>>,
+    pub sockid: c_int,
 }
 
 impl DtpConnection {
@@ -42,11 +49,39 @@ impl DtpConnection {
         }
     }
 }
+
+pub async fn send(
+    tx: tokio::sync::mpsc::Sender<DtpMsg>,
+    buf: Vec<u8>,
+    fin: bool,
+    stream_id: u64,
+) -> Result<usize> {
+    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    tx.send(DtpMsg::DtpSend {
+        buf,
+        fin,
+        stream_id,
+        resp: resp_tx,
+    })
+    .await
+    .unwrap();
+
+    match resp_rx.await.unwrap() {
+        DtpMsg::DtpSendRet { res } => match res {
+            Ok(s) => Ok(s),
+            Err(e) => Err(anyhow!(e)),
+        },
+        DtpMsg::DtpSendRetry => Err(anyhow!("retry")),
+        _ => Err(anyhow!("error in send ret recv")),
+    }
+}
+
 #[repr(C)]
 #[derive(Default)]
 pub struct DtpServerConns {
     server: Option<Arc<Mutex<DtpServer>>>,
     handle: Option<JoinHandle<()>>,
+    waker: Option<Arc<Mutex<mio::Waker>>>,
 }
 
 impl DtpServerConns {
@@ -81,8 +116,8 @@ pub struct DtpApi {
     pub sock_map: HashMap<c_int, Option<Arc<Mutex<UdpSocket>>>>,
     pub client_map: HashMap<c_int, Arc<Mutex<DtpClient>>>,
     pub server_map: HashMap<c_int, Arc<Mutex<DtpServer>>>,
-    pub server_handles: HashMap<c_int, std::thread::JoinHandle<()>>,
-    pub client_handles: HashMap<c_int, std::thread::JoinHandle<()>>,
+    // pub server_handles: HashMap<c_int, std::thread::JoinHandle<()>>,
+    // pub client_handles: HashMap<c_int, std::thread::JoinHandle<()>>,
     next_fd: c_int, // 模拟产生的下一个 fd 编号
 }
 
@@ -140,4 +175,5 @@ lazy_static! {
 
 pub mod client;
 pub mod ffi;
+pub mod message;
 pub mod server;
