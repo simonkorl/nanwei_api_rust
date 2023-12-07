@@ -21,7 +21,7 @@ fn hex_dump(buf: &[u8]) -> String {
     vec.join("")
 }
 
-fn client_loop(
+pub fn client_loop(
     poll: Arc<Mutex<mio::Poll>>,
     events: Arc<Mutex<mio::Events>>,
     conn: Arc<Mutex<Connection>>,
@@ -174,30 +174,30 @@ fn client_loop(
     Ok(())
 }
 #[repr(C)]
-#[derive(Default)]
+#[derive(Clone)]
 pub struct DtpClient {
-    pub conn: Option<Arc<Mutex<Connection>>>, // 在客户端调用函数 connect 之后获得
-    pub socket: Option<Arc<Mutex<UdpSocket>>>,
-    pub waker: Option<Arc<Mutex<mio::Waker>>>,
-    peer_addr: Option<SocketAddr>,
-    poll: Option<Arc<Mutex<mio::Poll>>>, // 注册 socket 之后只在 client 循环中被引用
-    events: Option<Arc<Mutex<mio::Events>>>, // 只会在 client_loop 中被引用
-    sockid: Option<c_int>,
+    pub conn: Arc<Mutex<Connection>>, // 在客户端调用函数 connect 之后获得
+    pub socket: Arc<Mutex<UdpSocket>>,
+    pub waker: Arc<Mutex<mio::Waker>>,
+    pub peer_addr: SocketAddr,
+    pub poll: Arc<Mutex<mio::Poll>>, // 注册 socket 之后只在 client 循环中被引用
+    pub events: Arc<Mutex<mio::Events>>, // 只会在 client_loop 中被引用
+    pub sockid: c_int,
 }
 
 impl DtpClient {
     /// 在 connect 之后运行，持续运行
-    pub fn run(&self, id: i32) {
-        let p = self.poll.clone().unwrap().clone();
-        let e = self.events.clone().unwrap().clone();
-        let c = self.conn.clone().unwrap().clone();
-        let s = self.socket.clone().unwrap().clone();
-        let peer = self.peer_addr.unwrap().clone();
-        let h = std::thread::spawn(move || {
-            client_loop(p, e, c, s, peer, id).unwrap();
-        });
-        h.join().unwrap();
-    }
+    // pub fn run(&self, id: i32) {
+    //     let p = self.poll.clone();
+    //     let e = self.events.clone();
+    //     let c = self.conn.clone();
+    //     let s = self.socket.clone();
+    //     let peer = self.peer_addr.clone();
+    //     let h = std::thread::spawn(move || {
+    //         client_loop(p, e, c, s, peer, id).unwrap();
+    //     });
+    //     h.join().unwrap();
+    // }
 
     /// 在 bind 之后调用，进行连接
     /// 可以使用这个函数直接返回一个 DtpClient
@@ -225,12 +225,13 @@ impl DtpClient {
 
         let waker = mio::Waker::new(poll.registry(), mio::Token(42)).unwrap();
 
-        let socket_arc = Some(Arc::new(Mutex::new(socket)));
+        let socket_arc = Arc::new(Mutex::new(socket));
+
+        let socket_arc_clone = socket_arc.clone();
 
         let mut out = [0; MAX_DATAGRAM_SIZE];
 
-        let binding = socket_arc.clone().unwrap();
-        let socket = binding.lock().unwrap();
+        let socket = socket_arc.lock().unwrap();
         // Generate a random source connection ID for the connection.
         let mut scid = [0; quiche::MAX_CONN_ID_LEN];
         SystemRandom::new().fill(&mut scid[..]).unwrap();
@@ -266,13 +267,13 @@ impl DtpClient {
         debug!("written {}", write);
 
         Ok(DtpClient {
-            conn: Some(Arc::new(Mutex::new(conn))),
-            socket: socket_arc,
-            peer_addr: Some(peer_addr),
-            poll: Some(Arc::new(Mutex::new(poll))),
-            events: Some(Arc::new(Mutex::new(events))),
-            sockid: Some(sockid),
-            waker: Some(Arc::new(Mutex::new(waker))),
+            conn: Arc::new(Mutex::new(conn)),
+            socket: socket_arc_clone,
+            peer_addr: peer_addr,
+            poll: Arc::new(Mutex::new(poll)),
+            events: Arc::new(Mutex::new(events)),
+            sockid: sockid,
+            waker: Arc::new(Mutex::new(waker)),
         })
     }
 }

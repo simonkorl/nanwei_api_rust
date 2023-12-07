@@ -21,33 +21,35 @@ use anyhow::Result;
 extern crate log;
 
 #[repr(C)]
-#[derive(Default)]
+#[derive(Clone)]
 /// 模拟的 conn_io 结构体
 /// 其中的结构和之前实现的 conn_io 完全不同
 pub struct DtpConnection {
-    pub client: Option<Arc<Mutex<DtpClient>>>,
+    // pub client: Option<Arc<Mutex<DtpClient>>>,
+    pub conn: Arc<Mutex<quiche::Connection>>,
+    pub waker: Arc<Mutex<mio::Waker>>,
     pub is_server_side: bool,
-    pub tx: Option<tokio::sync::mpsc::Sender<DtpMsg>>,
-    pub handle: Option<JoinHandle<()>>,
-    pub msg_handle: Option<tokio::task::JoinHandle<()>>,
+    // pub tx: Option<tokio::sync::mpsc::Sender<DtpMsg>>,
+    // pub handle: Option<JoinHandle<()>>,
+    // pub msg_handle: Option<tokio::task::JoinHandle<()>>,
     pub sockid: c_int,
 }
 
 impl DtpConnection {
-    pub fn join(self) -> Result<()> {
-        if let Some(h) = self.handle {
-            if !h.is_finished() {
-                match h.join() {
-                    Ok(_) => Ok(()),
-                    Err(e) => Err(anyhow!("{:?}", e)),
-                }
-            } else {
-                Ok(())
-            }
-        } else {
-            Ok(())
-        }
-    }
+    // pub fn join(self) -> Result<()> {
+    //     if let Some(h) = self.handle {
+    //         if !h.is_finished() {
+    //             match h.join() {
+    //                 Ok(_) => Ok(()),
+    //                 Err(e) => Err(anyhow!("{:?}", e)),
+    //             }
+    //         } else {
+    //             Ok(())
+    //         }
+    //     } else {
+    //         Ok(())
+    //     }
+    // }
 }
 
 pub async fn send(
@@ -77,28 +79,27 @@ pub async fn send(
 }
 
 #[repr(C)]
-#[derive(Default)]
 pub struct DtpServerConns {
-    server: Option<Arc<Mutex<DtpServer>>>,
-    handle: Option<JoinHandle<()>>,
-    waker: Option<Arc<Mutex<mio::Waker>>>,
+    server: Arc<Mutex<DtpServer>>,
+    waker: Arc<Mutex<mio::Waker>>,
+    sockid: c_int,
 }
 
 impl DtpServerConns {
-    pub fn join(self) -> Result<()> {
-        if let Some(h) = self.handle {
-            if !h.is_finished() {
-                match h.join() {
-                    Ok(_) => Ok(()),
-                    Err(e) => Err(anyhow!("{:?}", e)),
-                }
-            } else {
-                Ok(())
-            }
-        } else {
-            Ok(())
-        }
-    }
+    // pub fn join(self) -> Result<()> {
+    //     if let Some(h) = self.handle {
+    //         if !h.is_finished() {
+    //             match h.join() {
+    //                 Ok(_) => Ok(()),
+    //                 Err(e) => Err(anyhow!("{:?}", e)),
+    //             }
+    //         } else {
+    //             Ok(())
+    //         }
+    //     } else {
+    //         Ok(())
+    //     }
+    // }
 }
 
 #[derive(Default)]
@@ -116,8 +117,8 @@ pub struct DtpApi {
     pub sock_map: HashMap<c_int, Option<Arc<Mutex<UdpSocket>>>>,
     pub client_map: HashMap<c_int, Arc<Mutex<DtpClient>>>,
     pub server_map: HashMap<c_int, Arc<Mutex<DtpServer>>>,
-    // pub server_handles: HashMap<c_int, std::thread::JoinHandle<()>>,
-    // pub client_handles: HashMap<c_int, std::thread::JoinHandle<()>>,
+    pub server_handles: HashMap<c_int, std::thread::JoinHandle<()>>,
+    pub client_handles: HashMap<c_int, std::thread::JoinHandle<()>>,
     next_fd: c_int, // 模拟产生的下一个 fd 编号
 }
 

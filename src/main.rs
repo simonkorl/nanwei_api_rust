@@ -7,11 +7,20 @@ use nanwei_api_rust::server::DtpServer;
 use nanwei_api_rust::DTP_API_MAP;
 use nanwei_api_rust::*;
 use nanwei_api_rust::{client::DtpClient, ffi::dtp_socket};
+use std::env;
 use std::sync::{Arc, Mutex};
 
 #[tokio::main]
 async fn main() {
     env_logger::init();
+    let client_num = {
+        if env::args().len() >= 2 {
+            let v: Vec<String> = env::args().collect();
+            v[1].parse::<u32>().unwrap_or(10)
+        } else {
+            10
+        }
+    };
     // 模拟启动 server
     let server_handle = std::thread::spawn(|| {
         let config_ptr = dtp_config_init();
@@ -27,13 +36,20 @@ async fn main() {
 
         // join?
         let conns = unsafe { Box::from_raw(conns_ptr) };
-        conns.join().unwrap();
+        let h = {
+            let mut api_map = DTP_API_MAP.lock().unwrap();
+            api_map
+                .server_handles
+                .remove(&sock)
+                .expect(format!("no server handle for {sock}").as_str())
+        };
+        h.join().unwrap();
         println!("server conns {} finished", sock);
     });
 
     // 模拟客户端程序
     let mut handles = vec![];
-    for _ in 0..100 {
+    for _ in 0..client_num {
         let h = tokio::spawn(async move {
             let sock = dtp_socket();
             info!("client sock {}", sock);
@@ -50,20 +66,49 @@ async fn main() {
                 unsafe { Box::from_raw(conn_io_ptr) }
             };
 
-            let tx = conn_io.tx.clone().unwrap();
-
-            let hs = tokio::spawn(async move {
+            let hs = std::thread::spawn(move || {
                 // 模拟发送数据
                 std::thread::sleep(std::time::Duration::from_secs(1));
-                let msg = "hello world".to_owned().as_bytes().to_vec();
-                match send(tx.clone(), msg.clone(), true, 8).await {
-                    Ok(_) => eprintln!("{sock} sent hello world"),
-                    Err(e) => eprintln!("{sock} failed to send hello world, may need to retry {e}"),
+                println!("enter thread {}", sock);
+                let msg = "hello world".to_owned();
+                let msg_ptr = msg.as_bytes().as_ptr();
+                let conn_io = conn_io.clone();
+                let conn_io_clone = conn_io.clone();
+                let conn_io_ptr = Box::into_raw(conn_io_clone);
+                loop {
+                    println!("{} conn_io_ptr: {:?}", sock, conn_io_ptr);
+                    match dtp_send(conn_io_ptr, msg_ptr, msg.len() as i32, true, 8) {
+                        x if x >= 0 => {
+                            println!("successfully send hello world {}", sock);
+                            break;
+                        }
+                        -1 => {
+                            println!("Done");
+                            break;
+                        }
+                        DTP_SEND_RETRY => {
+                            println!("dtp_send need retry {}, retrying", sock);
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                        e => {
+                            println!("failed to send msg in {}: {}", sock, e);
+                            break;
+                        }
+                    }
                 }
             });
 
-            hs.await.unwrap();
-            conn_io.join().unwrap();
+            let h = {
+                DTP_API_MAP
+                    .lock()
+                    .unwrap()
+                    .client_handles
+                    .remove(&sock)
+                    .expect(format!("no client handle for {sock}").as_str())
+            };
+            hs.join().unwrap();
+            // conn_io.join().unwrap();
+            h.join().unwrap();
             println!("conn {} finished", sock);
         });
         handles.push(h);

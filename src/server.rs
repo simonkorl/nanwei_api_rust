@@ -20,7 +20,7 @@ struct PartialResponse {
     written: usize,
 }
 
-struct Client {
+pub struct Client {
     conn: quiche::Connection,
 
     partial_responses: HashMap<u64, PartialResponse>,
@@ -34,7 +34,7 @@ struct ClientRequest {
     client_id: i32,
 }
 
-fn server_loop(
+pub fn server_loop(
     clients: Arc<Mutex<ClientMap>>,
     poll: Arc<Mutex<mio::Poll>>,
     events: Arc<Mutex<mio::Events>>,
@@ -50,6 +50,8 @@ fn server_loop(
 
     let rng = SystemRandom::new();
     let conn_id_seed = ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng).unwrap();
+
+    let mut msg_count = 0;
 
     // let waker = Arc::new(mio::Waker::new(poll.registry(), mio::Token(10)).unwrap());
 
@@ -287,12 +289,14 @@ fn server_loop(
                             );
 
                             if s != 4 {
+                                msg_count += 1;
                                 println!(
-                                    "{} stream {} has {} bytes (fin? {})",
+                                    "{} stream {} has {} bytes (fin? {}) {}",
                                     client_lock.conn.trace_id(),
                                     s,
                                     stream_buf.len(),
-                                    fin
+                                    fin,
+                                    msg_count
                                 );
                                 continue;
                             }
@@ -578,30 +582,30 @@ fn handle_writable(client: &mut Client, stream_id: u64) {
 }
 
 #[repr(C)]
-#[derive(Default)]
+#[derive(Clone)]
 pub struct DtpServer {
-    clients: Option<Arc<Mutex<ClientMap>>>,
-    pub socket: Option<Arc<Mutex<UdpSocket>>>,
-    poll: Option<Arc<Mutex<mio::Poll>>>, // 注册 socket 之后只在 client 循环中被引用
-    events: Option<Arc<Mutex<mio::Events>>>, // 只会在 server_loop 中被引用
+    pub clients: Arc<Mutex<ClientMap>>,
+    pub socket: Arc<Mutex<UdpSocket>>,
+    pub poll: Arc<Mutex<mio::Poll>>, // 注册 socket 之后只在 client 循环中被引用
+    pub events: Arc<Mutex<mio::Events>>, // 只会在 server_loop 中被引用
+    pub waker: Arc<Mutex<mio::Waker>>,
     pub config: Option<Arc<Mutex<Config>>>,
-    pub waker: Option<Arc<Mutex<mio::Waker>>>,
-    sockid: Option<c_int>,
+    pub sockid: Option<c_int>,
 }
 
 impl DtpServer {
-    pub fn run(&self) {
-        let clients = self.clients.clone().unwrap().clone();
-        let p = self.poll.clone().unwrap().clone();
-        let e = self.events.clone().unwrap().clone();
-        let s = self.socket.clone().unwrap().clone();
-        let c = self.config.clone().unwrap().clone();
-        let w = self.waker.clone().unwrap().clone();
-        let h = std::thread::spawn(move || {
-            server_loop(clients, p, e, s, c, w).unwrap();
-        });
-        h.join().unwrap();
-    }
+    // pub fn run(&self) {
+    //     let clients = self.clients.clone().unwrap().clone();
+    //     let p = self.poll.clone().unwrap().clone();
+    //     let e = self.events.clone().unwrap().clone();
+    //     let s = self.socket.clone().unwrap().clone();
+    //     let c = self.config.clone().unwrap().clone();
+    //     let w = self.waker.clone().unwrap().clone();
+    //     let h = std::thread::spawn(move || {
+    //         server_loop(clients, p, e, s, c, w).unwrap();
+    //     });
+    //     h.join().unwrap();
+    // }
 
     /// 根据目的地址创建一个 DtpServer
     /// 其可以通过调用 run 来运行
@@ -623,13 +627,13 @@ impl DtpServer {
         let clients = Arc::new(Mutex::new(ClientMap::new()));
 
         Ok(DtpServer {
-            poll: Some(Arc::new(Mutex::new(poll))),
-            events: Some(Arc::new(Mutex::new(events))),
-            clients: Some(clients),
-            socket: Some(Arc::new(Mutex::new(socket))),
+            poll: Arc::new(Mutex::new(poll)),
+            events: Arc::new(Mutex::new(events)),
+            clients: clients,
+            socket: Arc::new(Mutex::new(socket)),
             config: Some(config),
             sockid: None,
-            waker: Some(Arc::new(Mutex::new(waker))),
+            waker: Arc::new(Mutex::new(waker)),
         })
     }
 
@@ -654,13 +658,13 @@ impl DtpServer {
         let clients = Arc::new(Mutex::new(ClientMap::new()));
 
         Ok(DtpServer {
-            poll: Some(Arc::new(Mutex::new(poll))),
-            events: Some(Arc::new(Mutex::new(events))),
-            clients: Some(clients),
-            socket: Some(Arc::new(Mutex::new(socket))),
+            poll: Arc::new(Mutex::new(poll)),
+            events: Arc::new(Mutex::new(events)),
+            clients: clients,
+            socket: Arc::new(Mutex::new(socket)),
             config: None,
             sockid: Some(sockid),
-            waker: Some(Arc::new(Mutex::new(waker))),
+            waker: Arc::new(Mutex::new(waker)),
         })
     }
 }

@@ -1,11 +1,13 @@
 use libc::c_char;
 use libc::c_int;
 
+use std::cell::Ref;
 use std::ffi;
 
-use crate::client::DtpClient;
+use crate::client::*;
 use crate::message::*;
 use crate::server::DtpServer;
+use crate::server::*;
 use crate::DTP_API_MAP;
 use crate::{DtpConnection, DtpServerConns};
 use quiche::Config;
@@ -35,6 +37,15 @@ fn error_to_c(e: Error) -> libc::ssize_t {
     }
 }
 const QUICHE_PROTOCOL_VERSION: u32 = 0x00000001;
+pub const DTP_SEND_RETRY: c_int = -42;
+pub const DTP_NULL: c_int = -404;
+
+#[repr(C)]
+enum DtpError {
+    DtpSendRetry = -42,
+    DtpNull = -404,
+    DtpDefaultErr = -444,
+}
 
 //----------API接口函数声明---------
 //生成默认的客户端和服务端的配置文件
@@ -149,7 +160,7 @@ pub extern "C" fn dtp_bind(sock: c_int, ip: *const c_char, port: c_int) -> c_int
         }
     };
 
-    api_map.sock_map.insert(sock, server.socket.clone());
+    api_map.sock_map.insert(sock, Some(server.socket.clone()));
     api_map
         .server_map
         .insert(sock, Arc::new(Mutex::new(server)));
@@ -162,6 +173,7 @@ pub extern "C" fn dtp_bind(sock: c_int, ip: *const c_char, port: c_int) -> c_int
 非阻塞
 成功返回一个会话地址，失败返回NULL
 只有 server 会调用这个函数
+dtp_listen 会 consume 掉 config 。它不需要再进行释放，同时也不能再次被使用。
 */
 #[no_mangle]
 pub extern "C" fn dtp_listen(sock: c_int, config: *mut Config) -> *mut DtpServerConns {
@@ -186,18 +198,30 @@ pub extern "C" fn dtp_listen(sock: c_int, config: *mut Config) -> *mut DtpServer
             return std::ptr::null_mut();
         }
     };
+
+    let server_clone = server_arc.clone();
     let waker = server_arc.clone().lock().unwrap().waker.clone();
     // TODO: 使用线程来运行 DtpServer 以及相关的程序
     let c = server_arc.clone();
     let h = std::thread::spawn(move || {
-        c.lock().unwrap().run();
+        let (clients, p, e, s, c, w) = {
+            let server = server_clone.lock().unwrap();
+            let clients = server.clients.clone();
+            let p = server.poll.clone();
+            let e = server.events.clone();
+            let s = server.socket.clone();
+            let c = server.config.clone().unwrap().clone();
+            let w = server.waker.clone();
+            (clients, p, e, s, c, w)
+        };
+        server_loop(clients, p, e, s, c, w).unwrap();
     });
-    // api_map.server_handles.insert(sock, h);
+    api_map.server_handles.insert(sock, h);
 
     let conns = DtpServerConns {
-        server: Some(server_arc.clone()),
-        handle: Some(h),
+        server: server_arc.clone(),
         waker,
+        sockid: sock,
     };
 
     return Box::into_raw(Box::new(conns));
@@ -230,6 +254,15 @@ pub extern "C" fn dtp_connect(
     port: c_int,
     config: *mut Config,
 ) -> *mut DtpConnection {
+    let config = unsafe {
+        if let Some(c) = config.as_mut() {
+            c
+        } else {
+            error!("error in dtp_connect: Config is null");
+            return std::ptr::null_mut();
+        }
+    };
+
     let mut api_map = DTP_API_MAP.lock().unwrap();
     if !api_map.has_sock_entry(sock) {
         error!("error in dtp_connect: no such sock {}", sock);
@@ -240,42 +273,64 @@ pub extern "C" fn dtp_connect(
         return std::ptr::null_mut();
     }
     let ip = unsafe { ffi::CStr::from_ptr(ip).to_str().unwrap() };
-    let mut config = unsafe { Box::from_raw(config) };
-    let client = DtpClient::connect(ip.to_owned(), port, config.as_mut(), sock).unwrap();
-
-    let conn = client.conn.clone().unwrap();
-    let waker = client.waker.clone().unwrap();
-
-    api_map.sock_map.insert(sock, client.socket.clone());
-
+    // 创建 client
+    let client = DtpClient::connect(ip.to_owned(), port, config, sock).unwrap();
+    // move client 到一个储存的地方
     let client_arc = Arc::new(Mutex::new(client));
 
-    let c = client_arc.clone();
+    let client_arc_clone = client_arc.clone();
+
+    let client_clone = {
+        let client_lock = client_arc.lock().unwrap();
+        client_lock.clone()
+    };
+
+    let conn = client_clone.conn.clone();
+    let conn_clone = conn.clone();
+    let waker = client_clone.waker.clone();
+    let waker_clone = waker.clone();
+    let socket = client_clone.socket.clone();
+
+    api_map.sock_map.insert(sock, Some(socket));
+
+    let (p, e, c, s, peer) = {
+        let client = client_arc_clone.lock().unwrap().clone();
+        (
+            client.poll,
+            client.events,
+            client.conn,
+            client.socket,
+            client.peer_addr,
+        )
+    };
 
     api_map.sock_map.get_mut(&sock).as_mut();
     api_map.client_map.insert(sock, client_arc.clone());
 
     // TODO: 运行 client 的线程
     let h = std::thread::spawn(move || {
-        c.lock().unwrap().run(sock);
+        client_loop(p, e, c, s, peer, sock).unwrap();
         println!("client main loop stopped {}", sock);
     });
 
-    let (tx, rx) = tokio::sync::mpsc::channel(32);
+    // TODO: 运行通讯线程
+    // let (tx, rx) = tokio::sync::mpsc::channel(32);
 
-    let hm = tokio::spawn(async move {
-        recv_msg_loop(rx, conn, waker).await;
-        println!("client msg loop finished {}", sock);
-    });
+    // let hm = tokio::spawn(async move {
+    //     recv_msg_loop(rx, conn, waker).await;
+    //     println!("client msg loop finished {}", sock);
+    // });
 
-    // api_map.client_handles.insert(sock, h);
+    api_map.client_handles.insert(sock, h);
 
     let conn_io = DtpConnection {
-        client: Some(client_arc.clone()),
-        handle: Some(h),
-        msg_handle: Some(hm),
+        // client: Some(client_arc.clone()),
+        conn: conn_clone,
+        waker: waker_clone,
+        // handle: Some(h),
+        // msg_handle: Some(hm),
         is_server_side: false,
-        tx: Some(tx),
+        // tx: Some(tx),
         sockid: sock,
     };
 
@@ -309,13 +364,43 @@ fin：发送端使用，标识这个流的数据传输完成。同理接收端�
 */
 #[no_mangle]
 pub extern "C" fn dtp_send(
-    _conns: *mut DtpConnection,
-    _buf: *const u8,
-    _buflen: c_int,
-    _fin: c_bool,
-    _stream_id: c_int,
+    conn_io: *mut DtpConnection,
+    buf: *const u8,
+    buflen: c_int,
+    fin: c_bool,
+    stream_id: c_int,
 ) -> c_int {
-    return -1;
+    let conn_io = unsafe {
+        if let Some(c) = conn_io.as_ref() {
+            c
+        } else {
+            return DTP_NULL;
+        }
+    };
+
+    // 调用 api 发送数据
+    let buf = unsafe { std::slice::from_raw_parts(buf, buflen as usize) };
+    let conn = conn_io.conn.clone();
+    let waker = conn_io.waker.clone();
+    let mut conn_lock = conn.lock().unwrap();
+
+    if !conn_lock.is_established() {
+        return DTP_SEND_RETRY;
+    }
+
+    let ret = match conn_lock.stream_send(stream_id as u64, buf, fin) {
+        Ok(size) => size as c_int,
+        Err(e) => error_to_c(e) as c_int,
+    };
+
+    // 唤醒 poll 并且发送数据
+    waker
+        .lock()
+        .unwrap()
+        .wake()
+        .expect(format!("failed to wake in dtp_send {}", conn_lock.trace_id()).as_str());
+
+    return ret;
 }
 // int dtp_send_with_priority(struct conn_io *conn_io, char *buf, int buflen, bool fin,
 //                            int streamid, uint64_t priority);
@@ -383,20 +468,21 @@ pub extern "C" fn dtp_get_connio_listenfd(_conn_io: *mut DtpConnection) -> c_int
 */
 #[no_mangle]
 pub extern "C" fn dtp_connect_is_close(conn_io: *mut DtpConnection) -> c_int {
-    if conn_io.is_null() {
-        return -1;
-    }
-    let conn_io = unsafe { Box::from_raw(conn_io) };
-    if let Some(client) = conn_io.client {
-        if let Some(conn) = client.lock().unwrap().conn.as_ref() {
-            return conn.lock().unwrap().is_closed() as c_int;
-        } else {
-            error!("error in dtp_connect_is_close: conn is None");
-            return -1;
-        }
+    let conn_io = if let Some(s) = unsafe { conn_io.as_ref() } {
+        s
     } else {
-        error!("error in dtp_connect_is_close: client is None");
-        return -1;
+        return DtpError::DtpNull as c_int;
+    };
+    let api_map = DTP_API_MAP.lock().unwrap();
+    if let Some(client) = api_map.client_map.get(&conn_io.sockid) {
+        let conn = client.lock().unwrap().conn.clone();
+        return conn.lock().unwrap().is_closed() as c_int;
+    } else {
+        error!(
+            "error in dtp_connect_is_close: no such conn from sock {}",
+            conn_io.sockid
+        );
+        return DtpError::DtpDefaultErr as c_int;
     }
 }
 
@@ -407,20 +493,16 @@ pub extern "C" fn dtp_config_load_cert_chain_from_pem_file(
     config: *mut Config,
     path: *const c_char,
 ) -> c_int {
-    if config.is_null() {
-        eprintln!("some input args are null");
-        return -1;
-    }
-    let path = unsafe { ffi::CStr::from_ptr(path).to_str().unwrap() };
-
-    unsafe {
-        let config = &mut *config;
-
+    if let Some(config) = unsafe { config.as_mut() } {
+        let path = unsafe { ffi::CStr::from_ptr(path).to_str().unwrap() };
         return match config.load_cert_chain_from_pem_file(path) {
             Ok(_) => 0,
 
             Err(e) => error_to_c(e) as c_int,
         };
+    } else {
+        error!("some input args are null");
+        return -1;
     }
 }
 
@@ -430,34 +512,29 @@ pub extern "C" fn dtp_config_load_priv_key_from_pem_file(
     config: *mut Config,
     path: *const c_char,
 ) -> c_int {
-    if config.is_null() {
-        eprintln!("some input args are null");
-        return -1;
-    }
-    let path = unsafe { ffi::CStr::from_ptr(path).to_str().unwrap() };
-
-    unsafe {
-        let config = &mut *config;
+    if let Some(config) = unsafe { config.as_mut() } {
+        let path = unsafe { ffi::CStr::from_ptr(path).to_str().unwrap() };
         return match config.load_priv_key_from_pem_file(path) {
             Ok(_) => 0,
 
             Err(e) => error_to_c(e) as c_int,
         };
-    };
+    } else {
+        error!("some input args are null");
+        return -1;
+    }
 }
 
 // Sets the `max_idle_timeout` transport parameter.
 #[no_mangle]
 pub extern "C" fn dtp_config_set_max_idle_timeout(config: *mut Config, v: u64) -> c_int {
-    if config.is_null() {
-        eprintln!("some input args are null");
-        return -1;
-    }
-    unsafe {
-        let config = &mut *config;
+    if let Some(config) = unsafe { config.as_mut() } {
         config.set_max_idle_timeout(v);
         return 0;
-    };
+    } else {
+        error!("some input args are null");
+        return -1;
+    }
 }
 // Sets the `initial_max_stream_data_bidi_local` transport parameter.
 #[no_mangle]
@@ -465,15 +542,13 @@ pub extern "C" fn dtp_config_set_initial_max_stream_data_bidi_local(
     config: *mut Config,
     v: u64,
 ) -> c_int {
-    if config.is_null() {
-        eprintln!("some input args are null");
-        return -1;
-    }
-    unsafe {
-        let config = &mut *config;
+    if let Some(config) = unsafe { config.as_mut() } {
         config.set_initial_max_stream_data_bidi_local(v);
         return 0;
-    };
+    } else {
+        error!("some input args are null");
+        return -1;
+    }
 }
 
 // Sets the `initial_max_stream_data_bidi_remote` transport parameter.
@@ -482,69 +557,59 @@ pub extern "C" fn dtp_config_set_initial_max_stream_data_bidi_remote(
     config: *mut Config,
     v: u64,
 ) -> c_int {
-    if config.is_null() {
-        eprintln!("some input args are null");
-        return -1;
-    }
-
-    unsafe {
-        let config = &mut *config;
+    if let Some(config) = unsafe { config.as_mut() } {
         config.set_initial_max_stream_data_bidi_remote(v);
         return 0;
-    };
+    } else {
+        error!("some input args are null");
+        return -1;
+    }
 }
 
 // Sets the `initial_max_stream_data_uni` transport parameter.
 #[no_mangle]
 pub extern "C" fn dtp_config_set_initial_max_stream_data_uni(config: *mut Config, v: u64) -> c_int {
-    if config.is_null() {
-        eprintln!("some input args are null");
-        return -1;
-    }
-    unsafe {
-        let config = &mut *config;
+    if let Some(config) = unsafe { config.as_mut() } {
         config.set_initial_max_stream_data_uni(v);
         return 0;
-    };
+    } else {
+        error!("some input args are null");
+        return -1;
+    }
 }
 
 // Sets the `initial_max_streams_bidi` transport parameter.
 #[no_mangle]
 pub extern "C" fn dtp_config_set_initial_max_streams_bidi(config: *mut Config, v: u64) -> c_int {
-    if config.is_null() {
-        eprintln!("some input args are null");
-        return -1;
-    }
-    unsafe {
-        let config = &mut *config;
+    if let Some(config) = unsafe { config.as_mut() } {
         config.set_initial_max_streams_bidi(v);
         return 0;
-    };
+    } else {
+        error!("some input args are null");
+        return -1;
+    }
 }
 
 // Sets the `initial_max_streams_uni` transport parameter.
 #[no_mangle]
 pub extern "C" fn dtp_config_set_initial_max_streams_uni(config: *mut Config, v: u64) -> c_int {
-    if config.is_null() {
-        eprintln!("some input args are null");
-        return -1;
-    }
-    unsafe {
-        let config = &mut *config;
+    if let Some(config) = unsafe { config.as_mut() } {
         config.set_initial_max_streams_uni(v);
         return 0;
-    };
+    } else {
+        error!("some input args are null");
+        return -1;
+    }
 }
 
 #[no_mangle]
 //打开或者关闭国密
 pub extern "C" fn dtp_config_set_gmssl_key(config: *mut Config, v: u64) -> c_int {
-    if config.is_null() {
-        return -1;
-    }
-    unsafe {
-        let config = &mut *config;
+    if let Some(config) = unsafe { config.as_mut() } {
         config.set_gmssl(v);
         return 0;
-    };
+    } else {
+        error!("some input args are null");
+        return -1;
+    }
 }
