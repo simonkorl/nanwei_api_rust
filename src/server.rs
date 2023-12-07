@@ -14,19 +14,28 @@ use serde::{Deserialize, Serialize};
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
-struct PartialResponse {
+pub struct PartialResponse {
     body: Vec<u8>,
 
     written: usize,
 }
 
-pub struct Client {
-    conn: quiche::Connection,
-
-    partial_responses: HashMap<u64, PartialResponse>,
+pub enum ClientStatus {
+    NotConnected,
+    Connected,
+    Close,
+    Wait,
 }
 
-type ClientMap = HashMap<quiche::ConnectionId<'static>, Arc<Mutex<Client>>>;
+pub struct Client {
+    pub conn: Arc<Mutex<quiche::Connection>>,
+
+    pub partial_responses: Arc<Mutex<HashMap<u64, PartialResponse>>>,
+
+    pub status: Arc<Mutex<ClientStatus>>,
+}
+
+type ClientMap = HashMap<quiche::ConnectionId<'static>, Client>;
 
 #[derive(Serialize, Deserialize)]
 struct ClientRequest {
@@ -63,13 +72,13 @@ pub fn server_loop(
             .lock()
             .unwrap()
             .values()
-            .filter_map(|c| c.lock().unwrap().conn.timeout())
+            .filter_map(|c| c.conn.lock().unwrap().timeout())
             .min();
         debug!("get timeout {:?}", timeout);
         poll.poll(&mut events, timeout).unwrap();
-
+        debug!("after poll");
         let socket = socket.lock().unwrap();
-
+        debug!("before reading");
         // Read incoming UDP packets from the socket and feed them to quiche,
         // until there are no more packets to read.
         'read: loop {
@@ -83,7 +92,7 @@ pub fn server_loop(
                     .lock()
                     .unwrap()
                     .values_mut()
-                    .for_each(|c| c.lock().unwrap().conn.on_timeout());
+                    .for_each(|c| c.conn.lock().unwrap().on_timeout());
 
                 break 'read;
             }
@@ -220,11 +229,12 @@ pub fn server_loop(
                 .unwrap();
 
                 let client = Client {
-                    conn,
-                    partial_responses: HashMap::new(),
+                    conn: Arc::new(Mutex::new(conn)),
+                    partial_responses: Arc::new(Mutex::new(HashMap::new())),
+                    status: Arc::new(Mutex::new(ClientStatus::Connected)),
                 };
 
-                clients_lock.insert(scid.clone(), Arc::new(Mutex::new(client)));
+                clients_lock.insert(scid.clone(), client);
 
                 clients_lock.get_mut(&scid).unwrap()
             } else {
@@ -241,13 +251,13 @@ pub fn server_loop(
             };
 
             // Process potentially coalesced packets.
-            let read = match client.lock().unwrap().conn.recv(pkt_buf, recv_info) {
+            let read = match client.conn.lock().unwrap().recv(pkt_buf, recv_info) {
                 Ok(v) => v,
 
                 Err(e) => {
                     error!(
                         "{} recv failed: {:?}",
-                        client.lock().unwrap().conn.trace_id(),
+                        client.conn.lock().unwrap().trace_id(),
                         e
                     );
                     continue 'read;
@@ -256,75 +266,104 @@ pub fn server_loop(
 
             debug!(
                 "{} processed {} bytes",
-                client.lock().unwrap().conn.trace_id(),
+                client.conn.lock().unwrap().trace_id(),
                 read
             );
 
-            if client.lock().unwrap().conn.is_in_early_data()
-                || client.lock().unwrap().conn.is_established()
-            {
+            let is_in_early_data = client.conn.lock().unwrap().is_in_early_data();
+            let is_established = client.conn.lock().unwrap().is_established();
+            debug!("after data");
+            if is_in_early_data || is_established {
+                debug!("in if");
                 // Handle writable streams.
                 {
-                    let mut client_lock = client.lock().unwrap();
-                    for stream_id in client_lock.conn.writable() {
+                    // let mut client_lock = client.lock().unwrap();
+                    let conn = client.conn.clone();
+                    let c = client.conn.clone();
+                    let partial_responses = client.partial_responses.clone();
+                    let writable = { c.lock().unwrap().writable() };
+                    for stream_id in writable {
                         debug!("in for");
-                        handle_writable(&mut client_lock, stream_id);
+                        handle_writable(conn.clone(), partial_responses.clone(), stream_id);
                     }
                 }
                 {
-                    let mut client_lock = client.lock().unwrap();
+                    debug!("process readable");
                     // Process all readable streams.
-                    for s in client_lock.conn.readable() {
-                        while let Ok((read, fin)) = client_lock.conn.stream_recv(s, &mut buf) {
-                            debug!("{} received {} bytes", client_lock.conn.trace_id(), read);
+                    let readable = { client.conn.lock().unwrap().readable() };
+                    for s in readable {
+                        debug!("in readable {}", s);
+                        loop {
+                            let recv = client.conn.lock().unwrap().stream_recv(s, &mut buf);
+                            match recv {
+                                Ok((read, fin)) => {
+                                    debug!(
+                                        "{} received {} bytes",
+                                        client.conn.lock().unwrap().trace_id(),
+                                        read
+                                    );
 
-                            let stream_buf = &buf[..read];
+                                    let stream_buf = &buf[..read];
 
-                            debug!(
-                                "{} stream {} has {} bytes (fin? {})",
-                                client_lock.conn.trace_id(),
-                                s,
-                                stream_buf.len(),
-                                fin
-                            );
+                                    debug!(
+                                        "{} stream {} has {} bytes (fin? {})",
+                                        client.conn.lock().unwrap().trace_id(),
+                                        s,
+                                        stream_buf.len(),
+                                        fin
+                                    );
 
-                            if s != 4 {
-                                msg_count += 1;
-                                println!(
-                                    "{} stream {} has {} bytes (fin? {}) {}",
-                                    client_lock.conn.trace_id(),
-                                    s,
-                                    stream_buf.len(),
-                                    fin,
-                                    msg_count
-                                );
-                                continue;
+                                    if s != 4 {
+                                        msg_count += 1;
+                                        println!(
+                                            "recv hello: {} stream {} has {} bytes (fin? {}) {}",
+                                            client.conn.lock().unwrap().trace_id(),
+                                            s,
+                                            stream_buf.len(),
+                                            fin,
+                                            msg_count
+                                        );
+                                        continue;
+                                    }
+
+                                    let async_buf = buf[..read].to_owned();
+                                    let waker_clone = waker.clone();
+                                    info!(
+                                        "before spawn {}",
+                                        client.conn.lock().unwrap().trace_id()
+                                    );
+
+                                    let conn = client.conn.clone();
+                                    let p = client.partial_responses.clone();
+
+                                    std::thread::spawn(move || {
+                                        info!("inside spawn");
+                                        info!("spawn for {}", conn.lock().unwrap().trace_id());
+                                        handle_stream(
+                                            conn.clone(),
+                                            p,
+                                            s,
+                                            async_buf.as_slice(),
+                                            "examples/root",
+                                            waker_clone,
+                                        );
+                                        info!(
+                                            "end spawning for {}",
+                                            conn.lock().unwrap().trace_id()
+                                        );
+                                    });
+                                    // let h = tokio::spawn(async move {
+                                    //     info!("inside spawn");
+                                    //     info!("spawn for {}", a.clone().lock().unwrap().conn.trace_id());
+                                    //     handle_stream(a, s, async_buf.as_slice(), "examples/root", waker_clone);
+                                    // });
+                                    // info!("get handle {:?}", h);
+                                }
+                                Err(_) => break,
                             }
-
-                            let a = Arc::clone(client);
-                            let async_buf = buf[..read].to_owned();
-                            let waker_clone = waker.clone();
-                            info!("before spawn {}", client_lock.conn.trace_id());
-
-                            std::thread::spawn(move || {
-                                info!("inside spawn");
-                                info!("spawn for {}", a.clone().lock().unwrap().conn.trace_id());
-                                handle_stream(
-                                    a,
-                                    s,
-                                    async_buf.as_slice(),
-                                    "examples/root",
-                                    waker_clone,
-                                );
-                            });
-                            // let h = tokio::spawn(async move {
-                            //     info!("inside spawn");
-                            //     info!("spawn for {}", a.clone().lock().unwrap().conn.trace_id());
-                            //     handle_stream(a, s, async_buf.as_slice(), "examples/root", waker_clone);
-                            // });
-                            // info!("get handle {:?}", h);
                         }
                     }
+                    debug!("after readable");
                 }
             }
         }
@@ -332,21 +371,27 @@ pub fn server_loop(
         // Generate outgoing QUIC packets for all active connections and send
         // them on the UDP socket, until quiche reports that there are no more
         // packets to be sent.
+        debug!("begin writing");
         for client in clients.lock().unwrap().values_mut() {
+            debug!(
+                "write loop: client {}",
+                client.conn.clone().lock().unwrap().trace_id()
+            );
             loop {
-                let mut client = client.lock().unwrap();
-                let (write, send_info) = match client.conn.send(&mut out) {
+                let mut conn_lock = client.conn.lock().unwrap();
+                debug!("hello");
+                let (write, send_info) = match conn_lock.send(&mut out) {
                     Ok(v) => v,
 
                     Err(quiche::Error::Done) => {
-                        debug!("{} done writing", client.conn.trace_id());
+                        debug!("{} done writing", conn_lock.trace_id());
                         break;
                     }
 
                     Err(e) => {
-                        error!("{} send failed: {:?}", client.conn.trace_id(), e);
+                        error!("{} send failed: {:?}", conn_lock.trace_id(), e);
 
-                        client.conn.close(false, 0x1, b"fail").ok();
+                        conn_lock.close(false, 0x1, b"fail").ok();
                         break;
                     }
                 };
@@ -360,24 +405,26 @@ pub fn server_loop(
                     panic!("send() failed: {:?}", e);
                 }
 
-                debug!("{} written {} bytes", client.conn.trace_id(), write);
+                debug!("{} written {} bytes", conn_lock.trace_id(), write);
             }
         }
 
         // Garbage collect closed connections.
+        debug!("before garbage");
         clients.lock().unwrap().retain(|_, ref mut c| {
             debug!("Collecting garbage");
-            let c = c.lock().unwrap();
-            if c.conn.is_closed() {
+            let conn_lock = c.conn.lock().unwrap();
+            if conn_lock.is_closed() {
                 info!(
                     "{} connection collected {:?}",
-                    c.conn.trace_id(),
-                    c.conn.stats()
+                    conn_lock.trace_id(),
+                    conn_lock.stats()
                 );
             }
 
-            !c.conn.is_closed()
+            !conn_lock.is_closed()
         });
+        debug!("after garbage")
     }
 }
 
@@ -438,61 +485,13 @@ fn validate_token<'a>(src: &net::SocketAddr, token: &'a [u8]) -> Option<quiche::
 /// Handles incoming HTTP/0.9 requests.
 #[tokio::main]
 async fn handle_stream(
-    client: Arc<Mutex<Client>>,
+    conn: Arc<Mutex<quiche::Connection>>,
+    partial_responses: Arc<Mutex<HashMap<u64, PartialResponse>>>,
     stream_id: u64,
     buf: &[u8],
     _root: &str,
     waker: Arc<Mutex<mio::Waker>>,
 ) {
-    // let conn = &mut client.conn;
-
-    // if buf.len() > 4 && &buf[..4] == b"GET " {
-    //     let uri = &buf[4..buf.len()];
-    //     let uri = String::from_utf8(uri.to_vec()).unwrap();
-    //     let uri = String::from(uri.lines().next().unwrap());
-    //     let uri = std::path::Path::new(&uri);
-    //     let mut path = std::path::PathBuf::from(root);
-
-    //     for c in uri.components() {
-    //         if let std::path::Component::Normal(v) = c {
-    //             path.push(v)
-    //         }
-    //     }
-
-    //     info!(
-    //         "{} got GET request for {:?} on stream {}",
-    //         conn.trace_id(),
-    //         path,
-    //         stream_id
-    //     );
-
-    //     let body = std::fs::read(path.as_path())
-    //         .unwrap_or_else(|_| b"Not Found!\r\n".to_vec());
-
-    //     info!(
-    //         "{} sending response of size {} on stream {}",
-    //         conn.trace_id(),
-    //         body.len(),
-    //         stream_id
-    //     );
-
-    //     let written = match conn.stream_send(stream_id, &body, true) {
-    //         Ok(v) => v,
-
-    //         Err(quiche::Error::Done) => 0,
-
-    //         Err(e) => {
-    //             error!("{} stream send failed {:?}", conn.trace_id(), e);
-    //             return;
-    //         },
-    //     };
-
-    //     if written < body.len() {
-    //         let response = PartialResponse { body, written };
-    //         client.partial_responses.insert(stream_id, response);
-    //     }
-    // }
-
     let data = &buf[0..buf.len()];
     let data = String::from_utf8(data.to_vec()).unwrap();
 
@@ -500,7 +499,7 @@ async fn handle_stream(
 
     info!(
         "{} got request {} from id {:?} on stream {}",
-        client.lock().unwrap().conn.trace_id(),
+        conn.lock().unwrap().trace_id(),
         data,
         req.client_id,
         stream_id
@@ -513,21 +512,26 @@ async fn handle_stream(
 
     info!(
         "{} sending response of size {} on stream {}",
-        client.lock().unwrap().conn.trace_id(),
+        conn.lock().unwrap().trace_id(),
         res.len(),
         stream_id
     );
 
-    let mut client_lock = client.lock();
-    let client: &mut Client = client_lock.as_mut().unwrap();
-    let conn = &mut client.conn;
-    let written = match conn.stream_send(stream_id, res.as_bytes(), true) {
+    let written = match conn
+        .lock()
+        .unwrap()
+        .stream_send(stream_id, res.as_bytes(), true)
+    {
         Ok(v) => v,
 
         Err(quiche::Error::Done) => 0,
 
         Err(e) => {
-            error!("{} stream send failed {:?}", conn.trace_id(), e);
+            error!(
+                "{} stream send failed {:?}",
+                conn.lock().unwrap().trace_id(),
+                e
+            );
             return;
         }
     };
@@ -537,28 +541,39 @@ async fn handle_stream(
             body: res.as_bytes().to_owned(),
             written,
         };
-        client.partial_responses.insert(stream_id, response);
+        partial_responses
+            .lock()
+            .unwrap()
+            .insert(stream_id, response);
     }
 
     // TODO: 创建事件，声明可以发送数据
-    debug!("try to send in handle stream: {}", client.conn.trace_id());
+    debug!(
+        "try to send in handle stream: {}",
+        conn.lock().unwrap().trace_id()
+    );
     waker.lock().unwrap().wake().expect("failed to wake");
 }
 
 /// Handles newly writable streams.
-fn handle_writable(client: &mut Client, stream_id: u64) {
+fn handle_writable(
+    conn: Arc<Mutex<quiche::Connection>>,
+    partial_responses: Arc<Mutex<HashMap<u64, PartialResponse>>>,
+    stream_id: u64,
+) {
     // let mut client_lock = client.lock();
     // let client: &mut Client = client_lock.as_mut().unwrap();
 
-    let conn = &mut client.conn;
+    let mut conn = conn.lock().unwrap();
+    let mut partial_responses = partial_responses.lock().unwrap();
 
     debug!("{} stream {} is writable", conn.trace_id(), stream_id);
 
-    if !client.partial_responses.contains_key(&stream_id) {
+    if !partial_responses.contains_key(&stream_id) {
         return;
     }
 
-    let resp = client.partial_responses.get_mut(&stream_id).unwrap();
+    let resp = partial_responses.get_mut(&stream_id).unwrap();
     let body = &resp.body[resp.written..];
 
     let written = match conn.stream_send(stream_id, body, true) {
@@ -567,7 +582,7 @@ fn handle_writable(client: &mut Client, stream_id: u64) {
         Err(quiche::Error::Done) => 0,
 
         Err(e) => {
-            client.partial_responses.remove(&stream_id);
+            partial_responses.remove(&stream_id);
 
             error!("{} stream send failed {:?}", conn.trace_id(), e);
             return;
@@ -577,7 +592,7 @@ fn handle_writable(client: &mut Client, stream_id: u64) {
     resp.written += written;
 
     if resp.written == resp.body.len() {
-        client.partial_responses.remove(&stream_id);
+        partial_responses.remove(&stream_id);
     }
 }
 

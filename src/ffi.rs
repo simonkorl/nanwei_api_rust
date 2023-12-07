@@ -37,12 +37,10 @@ fn error_to_c(e: Error) -> libc::ssize_t {
     }
 }
 const QUICHE_PROTOCOL_VERSION: u32 = 0x00000001;
-pub const DTP_SEND_RETRY: c_int = -42;
-pub const DTP_NULL: c_int = -404;
 
 #[repr(C)]
-enum DtpError {
-    DtpSendRetry = -42,
+pub enum DtpError {
+    DtpNotEstablished = -42,
     DtpNull = -404,
     DtpDefaultErr = -444,
 }
@@ -202,7 +200,6 @@ pub extern "C" fn dtp_listen(sock: c_int, config: *mut Config) -> *mut DtpServer
     let server_clone = server_arc.clone();
     let waker = server_arc.clone().lock().unwrap().waker.clone();
     // TODO: 使用线程来运行 DtpServer 以及相关的程序
-    let c = server_arc.clone();
     let h = std::thread::spawn(move || {
         let (clients, p, e, s, c, w) = {
             let server = server_clone.lock().unwrap();
@@ -310,7 +307,7 @@ pub extern "C" fn dtp_connect(
     // TODO: 运行 client 的线程
     let h = std::thread::spawn(move || {
         client_loop(p, e, c, s, peer, sock).unwrap();
-        println!("client main loop stopped {}", sock);
+        info!("client main loop stopped {}", sock);
     });
 
     // TODO: 运行通讯线程
@@ -345,13 +342,85 @@ pub extern "C" fn dtp_connect(
 */
 #[no_mangle]
 pub extern "C" fn dtp_recv(
-    _conns: *mut DtpConnection,
-    _buf: *mut u8,
-    _buflen: c_int,
-    _stream_id: *mut c_int,
-    _fin: *mut c_bool,
+    conn_io: *mut DtpConnection,
+    buf: *mut u8,
+    buflen: c_int,
+    stream_id: *mut c_int,
+    fin: *mut c_bool,
 ) -> c_int {
-    return -1;
+    let conn_io = unsafe {
+        if let Some(c) = conn_io.as_ref() {
+            c
+        } else {
+            return DtpError::DtpNull as c_int;
+        }
+    };
+
+    let stream_id = unsafe {
+        if let Some(s) = stream_id.as_mut() {
+            s
+        } else {
+            return DtpError::DtpNull as c_int;
+        }
+    };
+
+    let fin = unsafe {
+        if let Some(s) = fin.as_mut() {
+            s
+        } else {
+            return DtpError::DtpNull as c_int;
+        }
+    };
+
+    let mut buf = unsafe { std::slice::from_raw_parts_mut(buf, buflen as usize) };
+
+    // 调用 api 接收
+    let conn = conn_io.conn.clone();
+    let waker = conn_io.waker.clone();
+    let mut conn_lock = conn.lock().unwrap();
+
+    if !conn_lock.is_established() && !conn_lock.is_in_early_data() {
+        return DtpError::DtpNotEstablished as c_int;
+    }
+
+    let mut ret = 0usize;
+
+    for s in conn_lock.readable() {
+        match conn_lock.stream_recv(s, &mut buf) {
+            Ok((read, finish)) => {
+                debug!("{} received {} bytes", conn_lock.trace_id(), read);
+
+                let stream_buf = &buf[..read];
+
+                debug!(
+                    "{} stream {} has {} bytes (fin? {})",
+                    conn_lock.trace_id(),
+                    s,
+                    stream_buf.len(),
+                    finish
+                );
+                *stream_id = s as c_int;
+                *fin = finish;
+                ret = read;
+                break;
+            }
+            Err(Error::Done) => {
+                continue;
+            }
+            Err(e) => {
+                ret = error_to_c(e) as usize;
+            }
+        }
+    }
+
+    // 唤醒 poll 并且发送数据
+    waker
+        .lock()
+        .unwrap()
+        .wake()
+        .expect(format!("failed to wake in dtp_send {}", conn_lock.trace_id()).as_str());
+
+    return ret as c_int;
 }
 /*
 发送数据
@@ -374,7 +443,7 @@ pub extern "C" fn dtp_send(
         if let Some(c) = conn_io.as_ref() {
             c
         } else {
-            return DTP_NULL;
+            return DtpError::DtpNull as c_int;
         }
     };
 
@@ -384,8 +453,8 @@ pub extern "C" fn dtp_send(
     let waker = conn_io.waker.clone();
     let mut conn_lock = conn.lock().unwrap();
 
-    if !conn_lock.is_established() {
-        return DTP_SEND_RETRY;
+    if !conn_lock.is_established() && !conn_lock.is_in_early_data() {
+        return DtpError::DtpNotEstablished as c_int;
     }
 
     let ret = match conn_lock.stream_send(stream_id as u64, buf, fin) {
@@ -407,6 +476,7 @@ pub extern "C" fn dtp_send(
 /*关闭单个连接；用于客户端|服务端
 成功返回1，失败返回-1
 这个与下面dtp_close_connections的区别是，这个只会关闭单个链接
+这个函数会 consume 掉 conn_io，之后不能再次使用指针调用 conn_io
 */
 #[no_mangle]
 pub extern "C" fn dtp_close(conn_io: *mut DtpConnection) -> c_int {
@@ -414,7 +484,8 @@ pub extern "C" fn dtp_close(conn_io: *mut DtpConnection) -> c_int {
         error!("error in dtp_close: conn_io is null");
         return -1;
     }
-    // let conn_io = unsafe { Box::from_raw(conn_io) };
+
+    let conn_io = unsafe { Box::from_raw(conn_io) };
 
     // if !conn_io.is_server_side && is_established
     // connection close
@@ -446,6 +517,7 @@ pub extern "C" fn dtp_close_connections(_conns: *mut DtpServerConns) -> c_int {
 用于服务端：
 它返回以个pipe管道的读端。可以使用epoll等监听该文件描述符是否可读，如果判断为可读可调用dtp_recv获得数据。
 成功返回>0,失败返回-1
+TODO: 暂时禁用这个 API
 */
 #[no_mangle]
 pub extern "C" fn dtp_get_conns_listenfd(_conns: *mut DtpServerConns) -> c_int {
@@ -456,6 +528,7 @@ pub extern "C" fn dtp_get_conns_listenfd(_conns: *mut DtpServerConns) -> c_int {
 用于服务端|客户端
 获得一个链接的pipe管道读端，同理，可以使用epoll监听该文件描述符。
 ！！！这两个函数只能用于判断是否有数据可读，不可以使用于判断是否可写。！！
+TODO: 暂时禁用这个 API
 */
 #[no_mangle]
 pub extern "C" fn dtp_get_connio_listenfd(_conn_io: *mut DtpConnection) -> c_int {

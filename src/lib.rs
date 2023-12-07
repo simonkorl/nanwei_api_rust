@@ -22,6 +22,16 @@ extern crate log;
 
 #[repr(C)]
 #[derive(Clone)]
+pub struct LoopArgs {
+    pub conn: Arc<Mutex<quiche::Connection>>, // 在客户端调用函数 connect 之后获得，在服务端调用 bind 后获得
+    pub socket: Arc<Mutex<UdpSocket>>,        // 被绑定的 socket
+    pub waker: Arc<Mutex<mio::Waker>>,        // 实际首次创建 waker 并维持它的位置
+    pub poll: Arc<Mutex<mio::Poll>>,          // 注册 socket 之后只在执行的循环中被引用
+    pub events: Arc<Mutex<mio::Events>>,      // 只会在循环中被引用中被引用
+}
+
+#[repr(C)]
+#[derive(Clone)]
 /// 模拟的 conn_io 结构体
 /// 其中的结构和之前实现的 conn_io 完全不同
 pub struct DtpConnection {

@@ -69,29 +69,29 @@ async fn main() {
             let hs = std::thread::spawn(move || {
                 // 模拟发送数据
                 std::thread::sleep(std::time::Duration::from_secs(1));
-                println!("enter thread {}", sock);
+                info!("enter thread {}", sock);
                 let msg = "hello world".to_owned();
                 let msg_ptr = msg.as_bytes().as_ptr();
                 let conn_io = conn_io.clone();
                 let conn_io_clone = conn_io.clone();
                 let conn_io_ptr = Box::into_raw(conn_io_clone);
                 loop {
-                    println!("{} conn_io_ptr: {:?}", sock, conn_io_ptr);
+                    info!("{} conn_io_ptr: {:?}", sock, conn_io_ptr);
                     match dtp_send(conn_io_ptr, msg_ptr, msg.len() as i32, true, 8) {
                         x if x >= 0 => {
-                            println!("successfully send hello world {}", sock);
+                            info!("successfully send hello world {}", sock);
                             break;
                         }
                         -1 => {
-                            println!("Done");
+                            info!("Done");
                             break;
                         }
-                        DTP_SEND_RETRY => {
-                            println!("dtp_send need retry {}, retrying", sock);
+                        -42 => {
+                            info!("dtp_send need retry {}, retrying", sock);
                             std::thread::sleep(std::time::Duration::from_millis(100));
                         }
                         e => {
-                            println!("failed to send msg in {}: {}", sock, e);
+                            info!("failed to send msg in {}: {}", sock, e);
                             break;
                         }
                     }
@@ -109,7 +109,7 @@ async fn main() {
             hs.join().unwrap();
             // conn_io.join().unwrap();
             h.join().unwrap();
-            println!("conn {} finished", sock);
+            info!("conn {} finished", sock);
         });
         handles.push(h);
     }

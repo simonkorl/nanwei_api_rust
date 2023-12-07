@@ -1,7 +1,9 @@
+use crate::LoopArgs;
 use libc::c_int;
 use mio::net::UdpSocket;
 use quiche::{Config, Connection};
 use ring::rand::*;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -179,9 +181,9 @@ pub struct DtpClient {
     pub conn: Arc<Mutex<Connection>>, // 在客户端调用函数 connect 之后获得
     pub socket: Arc<Mutex<UdpSocket>>,
     pub waker: Arc<Mutex<mio::Waker>>,
-    pub peer_addr: SocketAddr,
     pub poll: Arc<Mutex<mio::Poll>>, // 注册 socket 之后只在 client 循环中被引用
     pub events: Arc<Mutex<mio::Events>>, // 只会在 client_loop 中被引用
+    pub peer_addr: SocketAddr,
     pub sockid: c_int,
 }
 
