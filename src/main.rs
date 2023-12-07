@@ -1,14 +1,12 @@
 #[macro_use]
 extern crate log;
 
-use anyhow::anyhow;
 use nanwei_api_rust::ffi::*;
-use nanwei_api_rust::server::DtpServer;
+
 use nanwei_api_rust::DTP_API_MAP;
-use nanwei_api_rust::*;
-use nanwei_api_rust::{client::DtpClient, ffi::dtp_socket};
+
+use nanwei_api_rust::ffi::dtp_socket;
 use std::env;
-use std::sync::{Arc, Mutex};
 
 #[tokio::main]
 async fn main() {
@@ -16,9 +14,9 @@ async fn main() {
     let client_num = {
         if env::args().len() >= 2 {
             let v: Vec<String> = env::args().collect();
-            v[1].parse::<u32>().unwrap_or(10)
+            v[1].parse::<u32>().unwrap_or(250)
         } else {
-            10
+            250
         }
     };
     // 模拟启动 server
@@ -35,7 +33,7 @@ async fn main() {
         let conns_ptr = dtp_listen(sock, config_ptr);
 
         // join?
-        let conns = unsafe { Box::from_raw(conns_ptr) };
+        let _conns = unsafe { Box::from_raw(conns_ptr) };
         let h = {
             let mut api_map = DTP_API_MAP.lock().unwrap();
             api_map

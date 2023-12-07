@@ -1,9 +1,8 @@
-use crate::LoopArgs;
 use libc::c_int;
 use mio::net::UdpSocket;
 use quiche::{Config, Connection};
 use ring::rand::*;
-use std::io::Write;
+
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 

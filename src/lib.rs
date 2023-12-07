@@ -1,14 +1,10 @@
-use futures::future::Join;
 use lazy_static::lazy_static;
 use libc::c_int;
 use mio::net::UdpSocket;
 
-use std::sync::mpsc;
-
 use std::collections::HashMap;
 
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
 
 use crate::client::DtpClient;
 use crate::message::DtpMsg;

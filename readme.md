@@ -11,6 +11,6 @@
 
 ## 运行测试样例测试程序
 
-`cargo run --release > client.log`
+`cargo run --release > client.log 2>client_err.log`
 
-应该可以在 client.log 程序中看到不断产生的 log 信息，大概一秒钟产生 30 个，一共产生 500 个
+应该可以在 client.log 程序中看到不断产生的 log 信息，大概一秒钟产生 30 个，一共产生 500 个。使用 C-c 退出程序。

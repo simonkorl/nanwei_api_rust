@@ -1,4 +1,3 @@
-use libc::c_int;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::*;
 use tokio::sync::oneshot;

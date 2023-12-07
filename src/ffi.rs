@@ -1,11 +1,10 @@
 use libc::c_char;
 use libc::c_int;
 
-use std::cell::Ref;
 use std::ffi;
 
 use crate::client::*;
-use crate::message::*;
+
 use crate::server::DtpServer;
 use crate::server::*;
 use crate::DTP_API_MAP;
@@ -485,7 +484,7 @@ pub extern "C" fn dtp_close(conn_io: *mut DtpConnection) -> c_int {
         return -1;
     }
 
-    let conn_io = unsafe { Box::from_raw(conn_io) };
+    let _conn_io = unsafe { Box::from_raw(conn_io) };
 
     // if !conn_io.is_server_side && is_established
     // connection close
