@@ -94,6 +94,6 @@ pub async fn recv_msg_loop(
             }
             _ => (),
         }
-        waker.lock().unwrap().wake();
+        waker.lock().unwrap().wake().expect("failed to wake");
     }
 }

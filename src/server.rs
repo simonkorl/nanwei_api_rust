@@ -37,6 +37,7 @@ pub struct Client {
 
 type ClientMap = HashMap<quiche::ConnectionId<'static>, Client>;
 
+#[allow(non_snake_case)]
 #[derive(Serialize, Deserialize)]
 struct ClientRequest {
     apiType: String,
@@ -49,7 +50,7 @@ pub fn server_loop(
     events: Arc<Mutex<mio::Events>>,
     socket: Arc<Mutex<UdpSocket>>,
     config: Arc<Mutex<Config>>,
-    waker: Arc<Mutex<mio::Waker>>,
+    _waker: Arc<Mutex<mio::Waker>>,
 ) -> Result<()> {
     let mut buf = [0; 65535];
     let mut out = [0; MAX_DATAGRAM_SIZE];
@@ -60,7 +61,7 @@ pub fn server_loop(
     let rng = SystemRandom::new();
     let conn_id_seed = ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng).unwrap();
 
-    let mut msg_count = 0;
+    let _msg_count = 0;
 
     // let waker = Arc::new(mio::Waker::new(poll.registry(), mio::Token(10)).unwrap());
 
@@ -318,37 +319,35 @@ pub fn server_loop(
                                     res.remove(0);
                                     res.insert(0, '+' as u8);
 
-                                    let written = match client.conn
-                                                .lock()
-                                                .unwrap()
-                                                .stream_send(4, &res, true)
-                                            {
-                                                Ok(v) => v,
+                                    let written = match client
+                                        .conn
+                                        .lock()
+                                        .unwrap()
+                                        .stream_send(4, &res, true)
+                                    {
+                                        Ok(v) => v,
 
-                                                Err(quiche::Error::Done) => 0,
+                                        Err(quiche::Error::Done) => 0,
 
-                                                Err(e) => {
-                                                    error!(
-                                                        "{} stream send failed {:?}",
-                                                        client.conn.lock().unwrap().trace_id(),
-                                                        e
-                                                    );
-                                                    continue;
-                                                }
-                                            };
+                                        Err(e) => {
+                                            error!(
+                                                "{} stream send failed {:?}",
+                                                client.conn.lock().unwrap().trace_id(),
+                                                e
+                                            );
+                                            continue;
+                                        }
+                                    };
                                     debug!("write response {}", written);
 
-                                        if written < res.len() {
-                                            let response = PartialResponse {
-                                                body: res,
-                                                written,
-                                            };
-                                            client.partial_responses
-                                                .lock()
-                                                .unwrap()
-                                                .insert(4, response);
-                                        }
-
+                                    if written < res.len() {
+                                        let response = PartialResponse { body: res, written };
+                                        client
+                                            .partial_responses
+                                            .lock()
+                                            .unwrap()
+                                            .insert(4, response);
+                                    }
                                 }
                                 Err(_) => break,
                             }
@@ -474,7 +473,7 @@ fn validate_token<'a>(src: &net::SocketAddr, token: &'a [u8]) -> Option<quiche::
 }
 
 /// Handles incoming HTTP/0.9 requests.
-/// 
+///
 /// 这个异步处理可以用来模拟服务器对于数据的处理
 /// 这个函数不再会在 server_loop 中被直接调用
 #[tokio::main]

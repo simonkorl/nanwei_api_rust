@@ -483,7 +483,6 @@ pub extern "C" fn dtp_send(
 */
 #[no_mangle]
 pub extern "C" fn dtp_close(conn_io: *mut DtpConnection) -> c_int {
-
     let conn_io = if let Some(conn_io) = unsafe { conn_io.as_mut() } {
         conn_io
     } else {
@@ -492,10 +491,23 @@ pub extern "C" fn dtp_close(conn_io: *mut DtpConnection) -> c_int {
     };
 
     if !conn_io.is_server_side && conn_io.conn.lock().unwrap().is_established() {
-        conn_io.conn.lock().unwrap().close(true, 0, "".as_bytes()).expect("failed to send close");
-        conn_io.waker.lock().unwrap().wake().expect("failed to wake conn after sending close");
+        conn_io
+            .conn
+            .lock()
+            .unwrap()
+            .close(true, 0, "".as_bytes())
+            .expect("failed to send close");
+        conn_io
+            .waker
+            .lock()
+            .unwrap()
+            .wake()
+            .expect("failed to wake conn after sending close");
     } else if conn_io.is_server_side && conn_io.conn.lock().unwrap().is_closed() {
-        debug!("can't close connection: client not finished {}", conn_io.sockid);
+        debug!(
+            "can't close connection: client not finished {}",
+            conn_io.sockid
+        );
         return -1;
     } else {
         // debug!("son of conections,pconns %p", conn_io->pconns);
@@ -506,8 +518,15 @@ pub extern "C" fn dtp_close(conn_io: *mut DtpConnection) -> c_int {
 
     if !conn_io.is_server_side {
         // join client
-        let client_handle = DTP_API_MAP.lock().unwrap().client_handles.remove(&conn_io.sockid).unwrap();
-        client_handle.join().expect(format!("failed to join client_handle of {}", conn_io.sockid).as_str());
+        let client_handle = DTP_API_MAP
+            .lock()
+            .unwrap()
+            .client_handles
+            .remove(&conn_io.sockid)
+            .unwrap();
+        client_handle
+            .join()
+            .expect(format!("failed to join client_handle of {}", conn_io.sockid).as_str());
         // release resources
         // 我们可以确保与当前 client 有关的指针在这个函数结束的时候被 drop
         // client 的所有存在的指针只有三个
@@ -518,7 +537,12 @@ pub extern "C" fn dtp_close(conn_io: *mut DtpConnection) -> c_int {
         let _box_c = unsafe { Box::from_raw(conn_io) };
         // 最后是 client_loop 创建的 client 对象，其储存在 client_map 里面。
         // 因为其中包括所有 client 相关数据的指针，例如 poll, events，所以我们最后释放
-        let _client = DTP_API_MAP.lock().unwrap().client_map.remove(&conn_io.sockid).unwrap();
+        let _client = DTP_API_MAP
+            .lock()
+            .unwrap()
+            .client_map
+            .remove(&conn_io.sockid)
+            .unwrap();
     } else {
         // remove conn_io from hash_table at server_side
         // release resources

@@ -27,8 +27,8 @@ pub fn client_loop(
     events: Arc<Mutex<mio::Events>>,
     conn: Arc<Mutex<Connection>>,
     socket: Arc<Mutex<UdpSocket>>,
-    peer_addr: SocketAddr,
-    id: i32,
+    _peer_addr: SocketAddr,
+    _id: i32,
 ) -> Result<()> {
     let mut buf = [0; 65535];
     let mut out = [0; MAX_DATAGRAM_SIZE];

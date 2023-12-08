@@ -1,8 +1,8 @@
 #[macro_use]
 extern crate log;
 
-use nanwei_api_rust::DtpConnection;
 use nanwei_api_rust::ffi::*;
+use nanwei_api_rust::DtpConnection;
 
 use nanwei_api_rust::DTP_API_MAP;
 
@@ -10,104 +10,126 @@ use nanwei_api_rust::ffi::dtp_socket;
 use std::env;
 use std::time::Instant;
 
-fn dtp_util_send(conn_io_ptr: *mut DtpConnection, sendData: &Vec<u8>) -> i32 {
+fn dtp_util_send(conn_io_ptr: *mut DtpConnection, send_data: &Vec<u8>) -> i32 {
     // encrypt
-    let mut data_bytes: Vec<u8> = sendData.clone();
+    let mut data_bytes: Vec<u8> = send_data.clone();
     data_bytes.insert(0, '+' as u8);
 
-    
-    info!("开始发送数据总大小：{}, 数据:{:?}", data_bytes.len(), data_bytes);
-    let startMillis = Instant::now();
+    info!(
+        "开始发送数据总大小：{}, 数据:{:?}",
+        data_bytes.len(),
+        data_bytes
+    );
+    let start_millis = Instant::now();
 
-    let sock = unsafe {conn_io_ptr.as_ref().unwrap().sockid};
+    let sock = unsafe { conn_io_ptr.as_ref().unwrap().sockid };
 
-    let send = 
-        loop {
-            match dtp_send(conn_io_ptr, data_bytes.as_ptr(), data_bytes.len() as i32, true, 4) {
-                x if x >= 0 => {
-                    info!("successfully send in {}", sock);
-                    break x;
-                }
-                -1 => {
-                    info!("Done");
-                    break -1;
-                }
-                -42 => {
-                    info!("dtp_send need retry in sock {}, retrying...", sock);
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                e => {
-                    info!("failed to send msg in sock {} : {}", sock, e);
-                    break e;
-                }
+    let send = loop {
+        match dtp_send(
+            conn_io_ptr,
+            data_bytes.as_ptr(),
+            data_bytes.len() as i32,
+            true,
+            4,
+        ) {
+            x if x >= 0 => {
+                info!("successfully send in {}", sock);
+                break x;
             }
+            -1 => {
+                info!("Done");
+                break -1;
+            }
+            -42 => {
+                info!("dtp_send need retry in sock {}, retrying...", sock);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            e => {
+                info!("failed to send msg in sock {} : {}", sock, e);
+                break e;
+            }
+        }
     };
     let waker = unsafe { conn_io_ptr.as_mut().unwrap().waker.clone() };
-    waker.lock().unwrap().wake().expect("failed to wake thread in dtpSend");
-    let endMillis = Instant::now();
-    info!("发送数据结束, 总发送大小:{},发送用时:{:?}", send, endMillis - startMillis);
+    waker
+        .lock()
+        .unwrap()
+        .wake()
+        .expect("failed to wake thread in dtpSend");
+    let end_millis = Instant::now();
+    info!(
+        "发送数据结束, 总发送大小:{},发送用时:{:?}",
+        send,
+        end_millis - start_millis
+    );
     return send;
 }
 
 fn dtp_util_recv(conn_io_ptr: *mut DtpConnection) -> String {
-    let startMillis = Instant::now();
-    let mut buf =  [0; 65535];
+    let start_millis = Instant::now();
+    let mut buf = [0; 65535];
 
     let mut stream_id = 0;
     let mut fin = false;
 
-    let sock = unsafe {conn_io_ptr.as_ref().unwrap().sockid};
+    let sock = unsafe { conn_io_ptr.as_ref().unwrap().sockid };
 
     let recv = loop {
         match dtp_recv(
-            conn_io_ptr, 
-            buf.as_mut_ptr(), 
-            buf.len() as i32, 
-            &mut stream_id, 
-            &mut fin) {
-                x if x >= 0 => {
-                    info!("接收到的数据长度:{}, 接收到的streamId:{}", x, stream_id);
-                    break x;
-                }
-                -1 => {
-                    info!("recv Done");
-                    break 0;
-                }
-                x if x < -1 => {
-                    match dtp_connect_is_close(conn_io_ptr) {
-                        1 => {
-                            info!("is closed in dtpRecv {}----", sock);
-                            break -1;
-                        }
-                        0 => {
-                            info!("{sock} not closed");
-                            break -1;
-                        }
-                        x if x < 0 => {
-                            error!("{sock} dtpRecv error {x}");
-                            break -1;
-                        }
-                        e => {
-                            error!("unexpect dtp_connect_is_close ret {e} in {sock}");
-                            break -1;
-                        }
-                    }
-                }
-                e => {
-                    error!("unexpect dtpRecv ret {e} in {sock}");
+            conn_io_ptr,
+            buf.as_mut_ptr(),
+            buf.len() as i32,
+            &mut stream_id,
+            &mut fin,
+        ) {
+            x if x >= 0 => {
+                info!("接收到的数据长度:{}, 接收到的streamId:{}", x, stream_id);
+                break x;
+            }
+            -1 => {
+                info!("recv Done");
+                break 0;
+            }
+            x if x < -1 => match dtp_connect_is_close(conn_io_ptr) {
+                1 => {
+                    info!("is closed in dtpRecv {}----", sock);
                     break -1;
                 }
+                0 => {
+                    info!("{sock} not closed");
+                    break -1;
+                }
+                x if x < 0 => {
+                    error!("{sock} dtpRecv error {x}");
+                    break -1;
+                }
+                e => {
+                    error!("unexpect dtp_connect_is_close ret {e} in {sock}");
+                    break -1;
+                }
+            },
+            e => {
+                error!("unexpect dtpRecv ret {e} in {sock}");
+                break -1;
             }
+        }
     };
-    
-    let endMillis = Instant::now();
+
+    let end_millis = Instant::now();
 
     if recv > 0 {
-        info!("接收完成,数据总长度:{}, resultByte: {:?}, 用时:{:?}", recv, String::from_utf8(buf[..recv as usize].to_vec()).expect("failed"),
-                endMillis - startMillis);
+        info!(
+            "接收完成,数据总长度:{}, resultByte: {:?}, 用时:{:?}",
+            recv,
+            String::from_utf8(buf[..recv as usize].to_vec()).expect("failed"),
+            end_millis - start_millis
+        );
     } else {
-        info!("接收完成，但是没有有效数据。数据总长度:{}, 用时:{:?}", recv,
-                endMillis - startMillis);
+        info!(
+            "接收完成，但是没有有效数据。数据总长度:{}, 用时:{:?}",
+            recv,
+            end_millis - start_millis
+        );
         return String::new();
     }
     // decrypt
@@ -160,7 +182,7 @@ async fn main() {
                     };
                     let ret = {
                         // dtpSend
-                        
+
                         let encrypted = format!("+{}", processed);
                         dtp_send(conn_io, buf, xxx)
                     };
@@ -200,7 +222,11 @@ async fn main() {
             };
 
             let msg = "hello world".to_owned();
-            println!("{} dtp_util_send, ret: {}", sock, dtp_util_send(conn_io_ptr, &msg.as_bytes().to_vec()));
+            println!(
+                "{} dtp_util_send, ret: {}",
+                sock,
+                dtp_util_send(conn_io_ptr, &msg.as_bytes().to_vec())
+            );
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 match dtp_util_recv(conn_io_ptr) {
@@ -220,7 +246,7 @@ async fn main() {
             } else {
                 error!("client {} failed to close", sock);
             }
-            
+
             println!("client {} finished", sock);
         });
         handles.push(h);
