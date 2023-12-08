@@ -36,10 +36,6 @@ pub fn client_loop(
     let mut poll = poll.lock().unwrap();
     let mut events = events.lock().unwrap();
 
-    let req_start = std::time::Instant::now();
-
-    let mut req_sent = false;
-
     loop {
         let timeout = conn.lock().unwrap().timeout();
         poll.poll(&mut events, timeout)?;
@@ -96,43 +92,14 @@ pub fn client_loop(
 
         debug!("done reading");
 
+        // TODO: 是否要这个时候退出？
         if conn.is_closed() {
             info!("connection closed, {:?}", conn.stats());
             break;
         }
 
-        // Send an HTTP request as soon as the connection is established.
-        if conn.is_established() && !req_sent {
-            info!("sending HTTP request for {:?}", peer_addr);
-
-            // let req = format!("GET {}\r\n", url.path());
-            let req = client_req_str(id);
-            conn.stream_send(HTTP_REQ_STREAM_ID, req.as_bytes(), true)
-                .unwrap();
-
-            req_sent = true;
-        }
-
         // Process all readable streams.
-        for s in conn.readable() {
-            while let Ok((read, fin)) = conn.stream_recv(s, &mut buf) {
-                debug!("received {} bytes", read);
-
-                let stream_buf = &buf[..read];
-
-                debug!("stream {} has {} bytes (fin? {})", s, stream_buf.len(), fin);
-
-                print!("{}", unsafe { std::str::from_utf8_unchecked(stream_buf) });
-
-                // The server reported that it has no more data to send, which
-                // we got the full response. Close the connection.
-                if s == HTTP_REQ_STREAM_ID && fin {
-                    info!("response received in {:?}, closing...", req_start.elapsed());
-
-                    conn.close(true, 0x00, b"kthxbye").unwrap();
-                }
-            }
-        }
+        // 这部分逻辑靠外部 api 实现，这里不再需要处理
 
         // Generate outgoing QUIC packets and send them on the UDP socket, until
         // quiche reports that there are no more packets to be sent.
