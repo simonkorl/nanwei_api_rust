@@ -20,6 +20,7 @@ pub struct PartialResponse {
     written: usize,
 }
 
+#[derive(PartialEq, Eq, Clone, Copy)]
 pub enum ClientStatus {
     NotConnected,
     Connected,
@@ -33,6 +34,8 @@ pub struct Client {
     pub partial_responses: Arc<Mutex<HashMap<u64, PartialResponse>>>,
 
     pub status: Arc<Mutex<ClientStatus>>,
+
+    pub scid: quiche::ConnectionId<'static>,
 }
 
 type ClientMap = HashMap<quiche::ConnectionId<'static>, Client>;
@@ -233,6 +236,7 @@ pub fn server_loop(
                     conn: Arc::new(Mutex::new(conn)),
                     partial_responses: Arc::new(Mutex::new(HashMap::new())),
                     status: Arc::new(Mutex::new(ClientStatus::Connected)),
+                    scid: scid.clone(),
                 };
 
                 clients_lock.insert(scid.clone(), client);
@@ -292,67 +296,67 @@ pub fn server_loop(
                 }
                 {
                     // Process all readable streams.
-                    let readable = { client.conn.lock().unwrap().readable() };
-                    for s in readable {
-                        debug!("in readable {}", s);
-                        loop {
-                            let recv = client.conn.lock().unwrap().stream_recv(s, &mut buf);
-                            match recv {
-                                Ok((read, fin)) => {
-                                    info!(
-                                        "{} received {} bytes",
-                                        client.conn.lock().unwrap().trace_id(),
-                                        read
-                                    );
+                    // let readable = { client.conn.lock().unwrap().readable() };
+                    // for s in readable {
+                    //     debug!("in readable {}", s);
+                    //     loop {
+                    //         let recv = client.conn.lock().unwrap().stream_recv(s, &mut buf);
+                    //         match recv {
+                    //             Ok((read, fin)) => {
+                    //                 info!(
+                    //                     "{} received {} bytes",
+                    //                     client.conn.lock().unwrap().trace_id(),
+                    //                     read
+                    //                 );
 
-                                    let stream_buf = &buf[..read];
+                    //                 let stream_buf = &buf[..read];
 
-                                    info!(
-                                        "{} stream {} has {} bytes (fin? {})",
-                                        client.conn.lock().unwrap().trace_id(),
-                                        s,
-                                        stream_buf.len(),
-                                        fin
-                                    );
+                    //                 info!(
+                    //                     "{} stream {} has {} bytes (fin? {})",
+                    //                     client.conn.lock().unwrap().trace_id(),
+                    //                     s,
+                    //                     stream_buf.len(),
+                    //                     fin
+                    //                 );
 
-                                    let mut res = stream_buf.to_vec();
-                                    res.remove(0);
-                                    res.insert(0, '+' as u8);
+                    //                 let mut res = stream_buf.to_vec();
+                    //                 res.remove(0);
+                    //                 res.insert(0, '+' as u8);
 
-                                    let written = match client
-                                        .conn
-                                        .lock()
-                                        .unwrap()
-                                        .stream_send(4, &res, true)
-                                    {
-                                        Ok(v) => v,
+                    //                 let written = match client
+                    //                     .conn
+                    //                     .lock()
+                    //                     .unwrap()
+                    //                     .stream_send(4, &res, true)
+                    //                 {
+                    //                     Ok(v) => v,
 
-                                        Err(quiche::Error::Done) => 0,
+                    //                     Err(quiche::Error::Done) => 0,
 
-                                        Err(e) => {
-                                            error!(
-                                                "{} stream send failed {:?}",
-                                                client.conn.lock().unwrap().trace_id(),
-                                                e
-                                            );
-                                            continue;
-                                        }
-                                    };
-                                    debug!("write response {}", written);
+                    //                     Err(e) => {
+                    //                         error!(
+                    //                             "{} stream send failed {:?}",
+                    //                             client.conn.lock().unwrap().trace_id(),
+                    //                             e
+                    //                         );
+                    //                         continue;
+                    //                     }
+                    //                 };
+                    //                 debug!("write response {}", written);
 
-                                    if written < res.len() {
-                                        let response = PartialResponse { body: res, written };
-                                        client
-                                            .partial_responses
-                                            .lock()
-                                            .unwrap()
-                                            .insert(4, response);
-                                    }
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                    }
+                    //                 if written < res.len() {
+                    //                     let response = PartialResponse { body: res, written };
+                    //                     client
+                    //                         .partial_responses
+                    //                         .lock()
+                    //                         .unwrap()
+                    //                         .insert(4, response);
+                    //                 }
+                    //             }
+                    //             Err(_) => break,
+                    //         }
+                    //     }
+                    // }
                     debug!("after readable");
                 }
             }
@@ -404,15 +408,23 @@ pub fn server_loop(
         clients.lock().unwrap().retain(|_, ref mut c| {
             debug!("Collecting garbage");
             let conn_lock = c.conn.lock().unwrap();
+            let conn_status = *c.status.lock().unwrap();
             if conn_lock.is_closed() {
-                info!(
-                    "{} connection collected {:?}",
-                    conn_lock.trace_id(),
-                    conn_lock.stats()
-                );
+                if conn_status == ClientStatus::Close {
+                    info!(
+                        "{} connection collected {:?}",
+                        conn_lock.trace_id(),
+                        conn_lock.stats()
+                    );
+                } else {
+                    info!(
+                        "{} connection cannot be collected, need client to close",
+                        conn_lock.trace_id(),
+                    );
+                }
             }
 
-            !conn_lock.is_closed()
+            !conn_lock.is_closed() || conn_status != ClientStatus::Close
         });
         debug!("after garbage")
     }

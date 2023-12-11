@@ -223,18 +223,54 @@ pub extern "C" fn dtp_listen(sock: c_int, config: *mut Config) -> *mut DtpServer
     return Box::into_raw(Box::new(conns));
 }
 
-/*
-接受链接
-is_block：是否阻塞；false = 非阻塞
-成功返回一个地址，失败返回NULL
-只有 server 会调用这个函数
-*/
+/// 接受链接
+/// is_block：是否阻塞；false = 非阻塞
+/// 成功返回一个地址，失败返回NULL
+/// 只有 server 会调用这个函数
+/// 这个函数当中的 _config 是一个假的参数，它不会被使用
+///server 只会使用 dtp_listen 提供的参数
 #[no_mangle]
 pub extern "C" fn dtp_accept(
-    _sock: c_int,
+    sock: c_int,
     _config: *mut Config,
-    _is_block: c_bool,
+    is_block: c_bool,
 ) -> *mut DtpConnection {
+    let server = {
+        let api_map = DTP_API_MAP.lock().unwrap();
+        if !api_map.has_server(sock) {
+            error!("sock {} is not a server", sock);
+            return std::ptr::null_mut();
+        }
+
+        api_map.server_map.get(&sock).unwrap().clone()
+    };
+
+    while is_block {
+        {
+            let clients = server.lock().unwrap().clients.clone();
+
+            let clients_clock = clients.lock().unwrap();
+            for (_, client) in clients_clock.iter() {
+                let status = client.status.lock().unwrap().clone();
+                if status == ClientStatus::NotConnected {
+                    *client.status.lock().unwrap() = ClientStatus::Connected;
+                    let conn_io = DtpConnection {
+                        conn: client.conn.clone(),
+                        waker: server.lock().unwrap().waker.clone(),
+                        is_server_side: true,
+                        sockid: None,
+                        pconns: Some(server.clone()),
+                        conn_id: Some(client.scid.clone()),
+                    };
+                    return Box::into_raw(Box::new(conn_io));
+                }
+            }
+        }
+        if is_block {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
     return std::ptr::null_mut();
 }
 
@@ -323,11 +359,13 @@ pub extern "C" fn dtp_connect(
         // client: Some(client_arc.clone()),
         conn: conn_clone,
         waker: waker_clone,
+        is_server_side: false,
         // handle: Some(h),
         // msg_handle: Some(hm),
-        is_server_side: false,
+        sockid: Some(sock),
         // tx: Some(tx),
-        sockid: sock,
+        pconns: None,
+        conn_id: None,
     };
 
     return Box::into_raw(Box::new(conn_io));
@@ -490,65 +528,89 @@ pub extern "C" fn dtp_close(conn_io: *mut DtpConnection) -> c_int {
         return -1;
     };
 
-    if !conn_io.is_server_side && conn_io.conn.lock().unwrap().is_established() {
-        conn_io
-            .conn
-            .lock()
-            .unwrap()
-            .close(true, 0, "".as_bytes())
-            .expect("failed to send close");
-        conn_io
-            .waker
-            .lock()
-            .unwrap()
-            .wake()
-            .expect("failed to wake conn after sending close");
-    } else if conn_io.is_server_side && conn_io.conn.lock().unwrap().is_closed() {
-        debug!(
-            "can't close connection: client not finished {}",
-            conn_io.sockid
-        );
-        return -1;
-    } else {
-        // debug!("son of conections,pconns %p", conn_io->pconns);
-        // pthread_rwlock_rdlock(&(conn_io->pconns->rwlock_hash));
-        // HASH_DELETE(hh, conn_io->pconns->h, conn_io);
-        // pthread_rwlock_unlock(&conn_io->pconns->rwlock_hash);
-    }
-
     if !conn_io.is_server_side {
-        // join client
-        let client_handle = DTP_API_MAP
-            .lock()
-            .unwrap()
-            .client_handles
-            .remove(&conn_io.sockid)
-            .unwrap();
-        client_handle
-            .join()
-            .expect(format!("failed to join client_handle of {}", conn_io.sockid).as_str());
-        // release resources
-        // 我们可以确保与当前 client 有关的指针在这个函数结束的时候被 drop
-        // client 的所有存在的指针只有三个
-        // 第一个是 client_loop 对应的 handle，在刚刚已经 join 了。如果顺利的话。。。
-        // 第二个是给出去的 Box::conn_io，里面包括了一个 conn 与一个 waker
-        // 我们使用 Box::from_raw 将其所有权取回
-        // 这个指针在这个 close 函数执行之后自动释放
-        let _box_c = unsafe { Box::from_raw(conn_io) };
-        // 最后是 client_loop 创建的 client 对象，其储存在 client_map 里面。
-        // 因为其中包括所有 client 相关数据的指针，例如 poll, events，所以我们最后释放
-        let _client = DTP_API_MAP
-            .lock()
-            .unwrap()
-            .client_map
-            .remove(&conn_io.sockid)
-            .unwrap();
+        if conn_io.conn.lock().unwrap().is_established() {
+            // 发送 close 信息
+            conn_io
+                .conn
+                .lock()
+                .unwrap()
+                .close(true, 0, "".as_bytes())
+                .expect("failed to send close");
+            conn_io
+                .waker
+                .lock()
+                .unwrap()
+                .wake()
+                .expect("failed to wake conn after sending close");
+            // join client
+            let client_handle = DTP_API_MAP
+                .lock()
+                .unwrap()
+                .client_handles
+                .remove(conn_io.sockid.as_ref().unwrap())
+                .unwrap();
+            client_handle.join().expect(
+                format!(
+                    "failed to join client_handle of {}",
+                    conn_io.sockid.unwrap()
+                )
+                .as_str(),
+            );
+            // release resources
+            // 我们可以确保与当前 client 有关的指针在这个函数结束的时候被 drop
+            // client 的所有存在的指针只有三个
+            // 第一个是 client_loop 对应的 handle，在刚刚已经 join 了。如果顺利的话。。。
+            // 第二个是给出去的 Box::conn_io，里面包括了一个 conn 与一个 waker
+            // 我们使用 Box::from_raw 将其所有权取回
+            // 这个指针在这个 close 函数执行之后自动释放
+            let _box_c = unsafe { Box::from_raw(conn_io) };
+            // 最后是 client_loop 创建的 client 对象，其储存在 client_map 里面。
+            // 因为其中包括所有 client 相关数据的指针，例如 poll, events，所以我们最后释放
+            let _client = DTP_API_MAP
+                .lock()
+                .unwrap()
+                .client_map
+                .remove(conn_io.sockid.as_ref().unwrap())
+                .unwrap();
+            return 1;
+        } else {
+            warn!("closing a not established connection {:?}", conn_io.sockid);
+            return -1;
+        }
     } else {
-        // remove conn_io from hash_table at server_side
-        // release resources
-    }
+        if !conn_io.conn.lock().unwrap().is_closed() {
+            debug!(
+                "can't close connection: client not finished {}",
+                conn_io.sockid.unwrap()
+            );
+            return -1;
+        } else {
+            // 这个分支只能用来释放 Box 中的信息
+            // 理论上来说，我们完全就不需要处理 clients_lock 中的数据
+            // 它一定能被 server_loop 因为超时回收
+            // 我们只需要防止 conn_io_ptr 引出的数据不能被正常释放就可以
 
-    return 1;
+            // 这里可以看出，server 的 garbage collect 环节可能会使得
+            // 某些 client 的资源被释放，但是 Box 中给出的 DtpConnection
+            // 却在之后可以调用。
+            // 为了防止这件事发生，我们将资源释放完全交给 server loop 处理
+            // 这里只通过标记一个 status，允许 garbage collect 回收特定的 conn_io
+            let conn_id = conn_io.conn_id.clone().unwrap();
+            debug!("son of conections, id {:?}", conn_id);
+            let pconns = conn_io.pconns.clone().unwrap();
+            let server_lock = pconns.lock().unwrap();
+            let clients = server_lock.clients.clone();
+            let mut clients_lock = clients.lock().unwrap();
+            if let Some(c) = clients_lock.get_mut(&conn_id) {
+                *c.status.lock().unwrap() = ClientStatus::Close;
+            }
+            // 释放 conn_io
+            let _conn_io = unsafe { Box::from_raw(conn_io) };
+
+            return 1;
+        }
+    }
 }
 
 /*
@@ -595,13 +657,13 @@ pub extern "C" fn dtp_connect_is_close(conn_io: *mut DtpConnection) -> c_int {
         return DtpError::DtpNull as c_int;
     };
     let api_map = DTP_API_MAP.lock().unwrap();
-    if let Some(client) = api_map.client_map.get(&conn_io.sockid) {
+    if let Some(client) = api_map.client_map.get(conn_io.sockid.as_ref().unwrap()) {
         let conn = client.lock().unwrap().conn.clone();
         return conn.lock().unwrap().is_closed() as c_int;
     } else {
         error!(
             "error in dtp_connect_is_close: no such conn from sock {}",
-            conn_io.sockid
+            conn_io.sockid.unwrap()
         );
         return DtpError::DtpDefaultErr as c_int;
     }

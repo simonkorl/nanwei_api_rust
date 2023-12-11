@@ -33,7 +33,7 @@ fn dtp_util_send(conn_io_ptr: *mut DtpConnection, send_data: &Vec<u8>) -> i32 {
             4,
         ) {
             x if x >= 0 => {
-                info!("successfully send in {}", sock);
+                info!("successfully send in {:?}", sock);
                 break x;
             }
             -1 => {
@@ -41,11 +41,11 @@ fn dtp_util_send(conn_io_ptr: *mut DtpConnection, send_data: &Vec<u8>) -> i32 {
                 break -1;
             }
             -42 => {
-                info!("dtp_send need retry in sock {}, retrying...", sock);
+                info!("dtp_send need retry in sock {:?}, retrying...", sock);
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             e => {
-                info!("failed to send msg in sock {} : {}", sock, e);
+                info!("failed to send msg in sock {:?} : {}", sock, e);
                 break e;
             }
         }
@@ -74,6 +74,8 @@ fn dtp_util_recv(conn_io_ptr: *mut DtpConnection) -> String {
 
     let sock = unsafe { conn_io_ptr.as_ref().unwrap().sockid };
 
+    let mut loop_count = 0;
+
     let recv = loop {
         match dtp_recv(
             conn_io_ptr,
@@ -82,9 +84,19 @@ fn dtp_util_recv(conn_io_ptr: *mut DtpConnection) -> String {
             &mut stream_id,
             &mut fin,
         ) {
-            x if x >= 0 => {
+            x if x > 0 => {
                 info!("接收到的数据长度:{}, 接收到的streamId:{}", x, stream_id);
                 break x;
+            }
+            0 => {
+                if loop_count < 20 {
+                    debug!("接收到的数据长度为 0 ，重试中。。。");
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    loop_count += 1;
+                } else {
+                    debug!("接收到的数据长度为 0 ，重试次数太多。");
+                    break 0;
+                }
             }
             -1 => {
                 info!("recv Done");
@@ -92,24 +104,24 @@ fn dtp_util_recv(conn_io_ptr: *mut DtpConnection) -> String {
             }
             x if x < -1 => match dtp_connect_is_close(conn_io_ptr) {
                 1 => {
-                    info!("is closed in dtpRecv {}----", sock);
+                    info!("is closed in dtpRecv {:?}----", sock);
                     break -1;
                 }
                 0 => {
-                    info!("{sock} not closed");
+                    info!("{:?} not closed", sock);
                     break -1;
                 }
                 x if x < 0 => {
-                    error!("{sock} dtpRecv error {x}");
+                    error!("{:?} dtpRecv error {x}", sock);
                     break -1;
                 }
                 e => {
-                    error!("unexpect dtp_connect_is_close ret {e} in {sock}");
+                    error!("unexpect dtp_connect_is_close ret {e} in {:?}", sock);
                     break -1;
                 }
             },
             e => {
-                error!("unexpect dtpRecv ret {e} in {sock}");
+                error!("unexpect dtpRecv ret {e} in {:?}", sock);
                 break -1;
             }
         }
@@ -162,37 +174,45 @@ async fn main() {
         dtp_bind(sock, ip_ptr, 4433);
         let conns_ptr = dtp_listen(sock, config_ptr);
 
-        /* TODO
         loop {
-            let conn_io = dtp_accept(conns, block = true);
-            std::thread::spawn(
-                || {
+            let conn_io_ptr = dtp_accept(sock, config_ptr, true);
+            if conn_io_ptr.is_null() {
+                break;
+            }
+            let box_ptr = unsafe { Box::from_raw(conn_io_ptr) };
+            std::thread::spawn(move || {
+                let conn_io_ptr = Box::into_raw(box_ptr);
 
-                    let result: String = {
-                        // dtpRecv
-                        let ret = dtp_recv(conn_io, buf, xxx);
-                        let recv = to_string(buf);
-                        // decrypt
-                        recv[1..].to_owned()
-                    };
-                    let processed = {
-                        // handle stream
-                        std::thread::sleep(Duration::from_secs(1));
-                        format!("processed {}", result)
-                    };
-                    let ret = {
-                        // dtpSend
+                let result = dtp_util_recv(conn_io_ptr);
+                println!("server recv {}", result);
 
-                        let encrypted = format!("+{}", processed);
-                        dtp_send(conn_io, buf, xxx)
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let processed = format!("[processed]{}", result);
+
+                let ret = dtp_util_send(conn_io_ptr, &processed.as_bytes().to_vec());
+                println!("server send {}", ret);
+
+                loop {
+                    match dtp_close(conn_io_ptr) {
+                        1 => {
+                            println!("server client closed");
+                            break;
+                        }
+                        -1 => {
+                            warn!("server client failed to close, waiting...");
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                        }
+                        e => {
+                            error!("unexpected server dtp_close ret value {e}");
+                        }
                     };
                 }
-            )
+            });
         }
-         */
 
         // join?
-        let _conns = unsafe { Box::from_raw(conns_ptr) };
+
+        let conns = unsafe { Box::from_raw(conns_ptr) };
         let h = {
             let mut api_map = DTP_API_MAP.lock().unwrap();
             api_map

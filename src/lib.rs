@@ -32,13 +32,14 @@ pub struct LoopArgs {
 /// 其中的结构和之前实现的 conn_io 完全不同
 pub struct DtpConnection {
     // pub client: Option<Arc<Mutex<DtpClient>>>,
+    pub is_server_side: bool,
     pub conn: Arc<Mutex<quiche::Connection>>,
     pub waker: Arc<Mutex<mio::Waker>>,
-    pub is_server_side: bool,
-    // pub tx: Option<tokio::sync::mpsc::Sender<DtpMsg>>,
-    // pub handle: Option<JoinHandle<()>>,
-    // pub msg_handle: Option<tokio::task::JoinHandle<()>>,
-    pub sockid: c_int,
+    // client only data
+    pub sockid: Option<c_int>,
+    // server only data
+    pub pconns: Option<Arc<Mutex<DtpServer>>>,
+    pub conn_id: Option<quiche::ConnectionId<'static>>,
 }
 
 impl DtpConnection {
@@ -86,9 +87,9 @@ pub async fn send(
 
 #[repr(C)]
 pub struct DtpServerConns {
-    server: Arc<Mutex<DtpServer>>,
-    waker: Arc<Mutex<mio::Waker>>,
-    sockid: c_int,
+    pub server: Arc<Mutex<DtpServer>>,
+    pub waker: Arc<Mutex<mio::Waker>>,
+    pub sockid: c_int,
 }
 
 impl DtpServerConns {
