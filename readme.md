@@ -3,11 +3,17 @@
 ## 安装 Rust 工具链
 - rustc 1.72.0 (5680fa18f 2023-08-23)
 
+## git submodule
+
+`git submodule update --init`
+
+请保证网络通常，可以正常访问 github.
+
 ## 构件库
 
 `cargo build --release`
 
-在 target/release 中找到 libnanwei_api_rust.so
+在 target/release 中找到 libnanwei_api_rust.so 即是所需要的编译库
 
 ## 运行测试样例测试程序
 

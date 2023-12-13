@@ -94,13 +94,14 @@ pub extern "C" fn dtp_config_init() -> *mut Config {
     return Box::into_raw(config);
 }
 
-/*
-创建套接字
-创建一个非阻塞的，地址可复用的udp；和tcp中的bind无异
-成功返回>0的sock，失败返回-1
+/**
+ * 创建套接字
+ * 创建一个非阻塞的，地址可复用的udp；和tcp中的bind无异
+ * 成功返回>0的sock，失败返回-1
 */
 #[no_mangle]
 pub extern "C" fn dtp_socket() -> c_int {
+    debug!("enter dtp_socket");
     return DTP_API_MAP.lock().unwrap().create_udp_fd();
 }
 
@@ -113,15 +114,15 @@ pub extern "C" fn dtp_socket() -> c_int {
 #[no_mangle]
 pub extern "C" fn dtp_socket_close(sock: c_int) -> c_int {
     let mut api_map = DTP_API_MAP.lock().unwrap();
-    if api_map.sock_map.get(&sock).is_none() {
+    if !api_map.has_sock_entry(sock) {
         error!("failed to close dtp_socket: no such sock, {}", sock);
         return -1;
     }
-    if api_map.client_map.get(&sock).is_some() {
+    if api_map.has_client(sock) {
         error!("failed to close dtp_socket: sock in use (client), {}", sock);
         return -1;
     }
-    if api_map.server_map.get(&sock).is_some() {
+    if api_map.has_server(sock) {
         error!("failed to close dtp_socket: sock in use (server), {}", sock);
         return -1;
     }
@@ -157,21 +158,17 @@ pub extern "C" fn dtp_bind(sock: c_int, ip: *const c_char, port: c_int) -> c_int
         }
     };
 
-    api_map.sock_map.insert(sock, Some(server.socket.clone()));
-    api_map
-        .server_map
-        .insert(sock, Arc::new(Mutex::new(server)));
+    api_map.sock_map.insert(sock, Some(server.get_socket()));
+    api_map.server_map.insert(sock, server);
     return 1;
 }
 
-/*
-监听端口
-设置监听端口
-非阻塞
-成功返回一个会话地址，失败返回NULL
-只有 server 会调用这个函数
-dtp_listen 会 consume 掉 config 。它不需要再进行释放，同时也不能再次被使用。
-*/
+/// 监听端口
+/// 设置监听端口
+/// 非阻塞
+/// 成功返回一个会话地址，失败返回NULL
+/// 只有 server 会调用这个函数
+/// !dtp_listen 会 consume 掉 config 。它不需要再进行释放，同时也不能再次被使用。
 #[no_mangle]
 pub extern "C" fn dtp_listen(sock: c_int, config: *mut Config) -> *mut DtpServerConns {
     let mut api_map = DTP_API_MAP.lock().unwrap();
@@ -184,41 +181,38 @@ pub extern "C" fn dtp_listen(sock: c_int, config: *mut Config) -> *mut DtpServer
     }
     // 在 dtp_bind 的基础上为 DtpServer 赋予 config 的值
     // 之后该结构体就可以运行 run 函数
-    let server_arc = {
+    let mut server = {
         if let Some(s) = api_map.server_map.get_mut(&sock) {
             let config = unsafe { Box::from_raw(config) };
             let config = Arc::new(Mutex::new(*config));
-            s.lock().unwrap().config = Some(config);
-            s.clone()
+            s.set_config(config);
+            api_map.server_map.remove(&sock).unwrap()
         } else {
             error!("error in dtp_listen: sock is not binded, {}", sock);
             return std::ptr::null_mut();
         }
     };
 
-    let server_clone = server_arc.clone();
-    let waker = server_arc.clone().lock().unwrap().waker.clone();
-    // TODO: 使用线程来运行 DtpServer 以及相关的程序
+    let streams = server.get_shared_streams();
+    let waker = server.get_waker();
+    let waker_clone = waker.clone();
+
+    // 使用线程来运行 DtpServer 以及相关的程序
     let h = std::thread::spawn(move || {
-        let (clients, p, e, s, c, w) = {
-            let server = server_clone.lock().unwrap();
-            let clients = server.clients.clone();
-            let p = server.poll.clone();
-            let e = server.events.clone();
-            let s = server.socket.clone();
-            let c = server.config.clone().unwrap().clone();
-            let w = server.waker.clone();
-            (clients, p, e, s, c, w)
-        };
-        server_loop(clients, p, e, s, c, w).unwrap();
+        server.run().unwrap();
     });
+
     api_map.server_handles.insert(sock, h);
+    api_map.server_shared_map.insert(sock, streams.clone());
 
     let conns = DtpServerConns {
-        server: server_arc.clone(),
+        // server: server_arc.clone(),
         waker,
+        streams,
         sockid: sock,
     };
+
+    api_map.server_waker_map.insert(sock, waker_clone);
 
     return Box::into_raw(Box::new(conns));
 }
@@ -227,40 +221,36 @@ pub extern "C" fn dtp_listen(sock: c_int, config: *mut Config) -> *mut DtpServer
 /// is_block：是否阻塞；false = 非阻塞
 /// 成功返回一个地址，失败返回NULL
 /// 只有 server 会调用这个函数
-/// 这个函数当中的 _config 是一个假的参数，它不会被使用
-///server 只会使用 dtp_listen 提供的参数
 #[no_mangle]
 pub extern "C" fn dtp_accept(
-    sock: c_int,
-    _config: *mut Config,
+    conns: *mut DtpServerConns,
     is_block: c_bool,
 ) -> *mut DtpConnection {
-    let server = {
-        let api_map = DTP_API_MAP.lock().unwrap();
-        if !api_map.has_server(sock) {
-            error!("sock {} is not a server", sock);
+    let conns = unsafe {
+        if let Some(c) = conns.as_mut() {
+            c
+        } else {
+            error!("error in dtp_accept: conns is null");
             return std::ptr::null_mut();
         }
-
-        api_map.server_map.get(&sock).unwrap().clone()
     };
-
-    while is_block {
+    let (shared_streams, waker) = (conns.streams.clone(), conns.waker.clone());
+    debug!("before dtp_accept loop");
+    loop {
         {
-            let clients = server.lock().unwrap().clients.clone();
-
-            let clients_clock = clients.lock().unwrap();
-            for (_, client) in clients_clock.iter() {
-                let status = client.status.lock().unwrap().clone();
-                if status == ClientStatus::NotConnected {
-                    *client.status.lock().unwrap() = ClientStatus::Connected;
+            let client_status = &mut shared_streams.lock().unwrap().client_status;
+            debug!("get client_status");
+            for (scid, (conn, status)) in client_status.iter_mut() {
+                debug!("accepting {:?}", scid);
+                if status == &mut ClientStatus::Connected {
+                    *status = ClientStatus::Accepted;
                     let conn_io = DtpConnection {
-                        conn: client.conn.clone(),
-                        waker: server.lock().unwrap().waker.clone(),
+                        conn: conn.clone(),
+                        waker,
                         is_server_side: true,
                         sockid: None,
-                        pconns: Some(server.clone()),
-                        conn_id: Some(client.scid.clone()),
+                        pconns: Some(shared_streams.clone()),
+                        conn_id: Some(scid.clone()),
                     };
                     return Box::into_raw(Box::new(conn_io));
                 }
@@ -268,17 +258,17 @@ pub extern "C" fn dtp_accept(
         }
         if is_block {
             std::thread::sleep(std::time::Duration::from_millis(100));
+        } else {
+            break;
         }
     }
 
     return std::ptr::null_mut();
 }
 
-/*
-发起连接
-成功返回地址，失败返回NULL
-只有 client 会调用这个函数
-*/
+/// 发起连接
+/// 成功返回地址，失败返回NULL
+/// 只有 client 会调用这个函数
 #[no_mangle]
 pub extern "C" fn dtp_connect(
     sock: c_int,
@@ -305,55 +295,38 @@ pub extern "C" fn dtp_connect(
         return std::ptr::null_mut();
     }
     let ip = unsafe { ffi::CStr::from_ptr(ip).to_str().unwrap() };
-    // 创建 client
-    let client = DtpClient::connect(ip.to_owned(), port, config, sock).unwrap();
-    // move client 到一个储存的地方
-    let client_arc = Arc::new(Mutex::new(client));
 
-    let client_arc_clone = client_arc.clone();
+    // 创建 client，它的所有权会被运行线程获得
+    // TODO: 在 client 退出的时候能否正确地释放数据？
+    let mut client = DtpClient::connect(ip.to_owned(), port, config, sock).unwrap();
 
-    let client_clone = {
-        let client_lock = client_arc.lock().unwrap();
-        client_lock.clone()
-    };
-
-    let conn = client_clone.conn.clone();
-    let conn_clone = conn.clone();
-    let waker = client_clone.waker.clone();
-    let waker_clone = waker.clone();
-    let socket = client_clone.socket.clone();
-
+    // let conn = client_clone.conn.clone();
+    let conn_clone = client.get_conn();
+    // let waker = client_clone.waker.clone();
+    let waker_clone = client.get_waker();
+    let socket = client.get_socket();
     api_map.sock_map.insert(sock, Some(socket));
 
-    let (p, e, c, s, peer) = {
-        let client = client_arc_clone.lock().unwrap().clone();
-        (
-            client.poll,
-            client.events,
-            client.conn,
-            client.socket,
-            client.peer_addr,
-        )
-    };
-
-    api_map.sock_map.get_mut(&sock).as_mut();
-    api_map.client_map.insert(sock, client_arc.clone());
-
-    // TODO: 运行 client 的线程
+    // 运行 client 的线程
     let h = std::thread::spawn(move || {
-        client_loop(p, e, c, s, peer, sock).unwrap();
+        client.run(sock).unwrap();
         info!("client main loop stopped {}", sock);
     });
 
-    // TODO: 运行通讯线程
-    // let (tx, rx) = tokio::sync::mpsc::channel(32);
-
-    // let hm = tokio::spawn(async move {
-    //     recv_msg_loop(rx, conn, waker).await;
-    //     println!("client msg loop finished {}", sock);
-    // });
-
     api_map.client_handles.insert(sock, h);
+
+    // 等待连接完全建立再返回，以防出现难以预测的情况
+    // ? 不过不确定是否可以得到正确的结果
+    let conn_wait = conn_clone.clone();
+    loop {
+        let is_established = conn_wait.lock().unwrap().is_established();
+        let is_in_early_data = conn_wait.lock().unwrap().is_in_early_data();
+        if is_established || is_in_early_data {
+            break;
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
 
     let conn_io = DtpConnection {
         // client: Some(client_arc.clone()),
@@ -416,7 +389,14 @@ pub extern "C" fn dtp_recv(
     let waker = conn_io.waker.clone();
     let mut conn_lock = conn.lock().unwrap();
 
+    debug!("after conn_lock");
     if !conn_lock.is_established() && !conn_lock.is_in_early_data() {
+        debug!(
+            "is_established{} in_early_data {} closed {}",
+            conn_lock.is_established(),
+            conn_lock.is_in_early_data(),
+            conn_lock.is_closed()
+        );
         return DtpError::DtpNotEstablished as c_int;
     }
 
@@ -425,6 +405,7 @@ pub extern "C" fn dtp_recv(
     let readable = conn_lock.readable();
 
     for s in readable {
+        debug!("in dtp_api readable {}", s);
         match conn_lock.stream_recv(s, &mut buf) {
             Ok((read, finish)) => {
                 debug!("{} received {} bytes", conn_lock.trace_id(), read);
@@ -455,11 +436,11 @@ pub extern "C" fn dtp_recv(
     }
 
     // 唤醒 poll 并且发送数据
-    waker
-        .lock()
-        .unwrap()
-        .wake()
-        .expect(format!("failed to wake in dtp_send {}", conn_lock.trace_id()).as_str());
+    // waker
+    //     .lock()
+    //     .unwrap()
+    //     .wake()
+    //     .expect(format!("failed to wake in dtp_send {}", conn_lock.trace_id()).as_str());
 
     return ret as c_int;
 }
@@ -495,6 +476,13 @@ pub extern "C" fn dtp_send(
     let mut conn_lock = conn.lock().unwrap();
 
     if !conn_lock.is_established() && !conn_lock.is_in_early_data() {
+        info!(
+            "dtp_send is_established {}, is_in_early_data {}, is_closed {}, is_timed_out {}",
+            conn_lock.is_established(),
+            conn_lock.is_in_early_data(),
+            conn_lock.is_closed(),
+            conn_lock.is_timed_out()
+        );
         return DtpError::DtpNotEstablished as c_int;
     }
 
@@ -530,6 +518,7 @@ pub extern "C" fn dtp_close(conn_io: *mut DtpConnection) -> c_int {
 
     if !conn_io.is_server_side {
         if conn_io.conn.lock().unwrap().is_established() {
+            info!("send close in {:?}", conn_io.sockid);
             // 发送 close 信息
             conn_io
                 .conn
@@ -567,12 +556,12 @@ pub extern "C" fn dtp_close(conn_io: *mut DtpConnection) -> c_int {
             let _box_c = unsafe { Box::from_raw(conn_io) };
             // 最后是 client_loop 创建的 client 对象，其储存在 client_map 里面。
             // 因为其中包括所有 client 相关数据的指针，例如 poll, events，所以我们最后释放
-            let _client = DTP_API_MAP
-                .lock()
-                .unwrap()
-                .client_map
-                .remove(conn_io.sockid.as_ref().unwrap())
-                .unwrap();
+            // let _client = DTP_API_MAP
+            //     .lock()
+            //     .unwrap()
+            //     .client_map
+            //     .remove(conn_io.sockid.as_ref().unwrap())
+            //     .unwrap();
             return 1;
         } else {
             warn!("closing a not established connection {:?}", conn_io.sockid);
@@ -596,14 +585,13 @@ pub extern "C" fn dtp_close(conn_io: *mut DtpConnection) -> c_int {
             // 却在之后可以调用。
             // 为了防止这件事发生，我们将资源释放完全交给 server loop 处理
             // 这里只通过标记一个 status，允许 garbage collect 回收特定的 conn_io
+            // TODO: 原来这么写会导致死锁，想想办法解决
             let conn_id = conn_io.conn_id.clone().unwrap();
             debug!("son of conections, id {:?}", conn_id);
             let pconns = conn_io.pconns.clone().unwrap();
-            let server_lock = pconns.lock().unwrap();
-            let clients = server_lock.clients.clone();
-            let mut clients_lock = clients.lock().unwrap();
-            if let Some(c) = clients_lock.get_mut(&conn_id) {
-                *c.status.lock().unwrap() = ClientStatus::Close;
+            let mut shared_streams = pconns.lock().unwrap();
+            if let Some((_, status)) = shared_streams.client_status.get_mut(&conn_id) {
+                *status = ClientStatus::Close;
             }
             // 释放 conn_io
             let _conn_io = unsafe { Box::from_raw(conn_io) };
@@ -627,7 +615,7 @@ pub extern "C" fn dtp_close_connections(_conns: *mut DtpServerConns) -> c_int {
 用于服务端：
 它返回以个pipe管道的读端。可以使用epoll等监听该文件描述符是否可读，如果判断为可读可调用dtp_recv获得数据。
 成功返回>0,失败返回-1
-TODO: 暂时禁用这个 API
+TODO: 暂时禁用这个 API，使用 C 监听 Rust 的 raw_fd 可能产生不可预测的结果
 */
 #[no_mangle]
 pub extern "C" fn dtp_get_conns_listenfd(_conns: *mut DtpServerConns) -> c_int {
@@ -638,7 +626,7 @@ pub extern "C" fn dtp_get_conns_listenfd(_conns: *mut DtpServerConns) -> c_int {
 用于服务端|客户端
 获得一个链接的pipe管道读端，同理，可以使用epoll监听该文件描述符。
 ！！！这两个函数只能用于判断是否有数据可读，不可以使用于判断是否可写。！！
-TODO: 暂时禁用这个 API
+TODO: 暂时禁用这个 API，使用 C 监听 Rust 的 raw_fd 可能产生不可预测的结果
 */
 #[no_mangle]
 pub extern "C" fn dtp_get_connio_listenfd(_conn_io: *mut DtpConnection) -> c_int {
@@ -656,17 +644,8 @@ pub extern "C" fn dtp_connect_is_close(conn_io: *mut DtpConnection) -> c_int {
     } else {
         return DtpError::DtpNull as c_int;
     };
-    let api_map = DTP_API_MAP.lock().unwrap();
-    if let Some(client) = api_map.client_map.get(conn_io.sockid.as_ref().unwrap()) {
-        let conn = client.lock().unwrap().conn.clone();
-        return conn.lock().unwrap().is_closed() as c_int;
-    } else {
-        error!(
-            "error in dtp_connect_is_close: no such conn from sock {}",
-            conn_io.sockid.unwrap()
-        );
-        return DtpError::DtpDefaultErr as c_int;
-    }
+
+    return conn_io.conn.lock().unwrap().is_closed() as c_int;
 }
 
 //--------参数配置------------------
@@ -795,4 +774,9 @@ pub extern "C" fn dtp_config_set_gmssl_key(config: *mut Config, v: u64) -> c_int
         error!("some input args are null");
         return -1;
     }
+}
+
+#[no_mangle]
+pub extern "C" fn debug_init() {
+    env_logger::init();
 }

@@ -96,7 +96,7 @@ fn dtp_util_recv(conn_io_ptr: *mut DtpConnection) -> String {
             0 => {
                 if loop_count < 20 {
                     info!("{:?} 接收到的数据长度为 0 ，重试中。。。", sock);
-                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    std::thread::sleep(std::time::Duration::from_millis(100));
                     loop_count += 1;
                 } else {
                     info!("{:?} 接收到的数据长度为 0 ，重试次数太多。", sock);
@@ -161,82 +161,11 @@ async fn main() {
     let client_num = {
         if env::args().len() >= 2 {
             let v: Vec<String> = env::args().collect();
-            v[1].parse::<u32>().unwrap_or(500)
+            v[1].parse::<u32>().unwrap_or(250)
         } else {
             500
         }
     };
-
-    // 模拟启动 server
-    let config_ptr = dtp_config_init();
-    dtp_config_set_max_idle_timeout(config_ptr, 100000);
-
-    let sock = dtp_socket();
-
-    debug!("server sock {}", sock);
-    let ip = std::ffi::CString::new("127.0.0.1").unwrap();
-    let ip_ptr = ip.as_ptr();
-    let ret = dtp_bind(sock, ip_ptr, 4433);
-    debug!("dtp_bind: {ret}");
-    let conns_ptr = dtp_listen(sock, config_ptr);
-
-    let conns_box = unsafe { Box::from_raw(conns_ptr) };
-
-    let server_handle = std::thread::spawn(move || {
-        let conns_ptr = Box::into_raw(conns_box);
-        loop {
-            let conn_io_ptr = dtp_accept(conns_ptr, true);
-
-            if conn_io_ptr.is_null() {
-                break;
-            }
-            let box_ptr = unsafe { Box::from_raw(conn_io_ptr) };
-            std::thread::spawn(move || {
-                let conn_io_ptr = Box::into_raw(box_ptr);
-
-                let result = loop {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                    match dtp_util_recv(conn_io_ptr) {
-                        x if x.len() == 0 => {
-                            debug!("keep recving hello_world...");
-                        }
-                        x if x.len() > 0 => {
-                            break x;
-                        }
-                        e => {
-                            debug!("server dtp_util_recv, ret: {:?}", e);
-                            break e;
-                        }
-                    }
-                };
-                info!("server recv Some({})", result);
-
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                let processed = format!("[processed]{}", result);
-
-                let ret = dtp_util_send(conn_io_ptr, 4, &processed.as_bytes().to_vec());
-                info!("server send Some({}) , size {}", result, ret);
-
-                loop {
-                    match dtp_close(conn_io_ptr) {
-                        1 => {
-                            info!("server client Some({}) closed", result);
-                            break;
-                        }
-                        -1 => {
-                            warn!("server client Some({}) failed to close, waiting...", result);
-                            std::thread::sleep(std::time::Duration::from_secs(1));
-                        }
-                        e => {
-                            error!(
-                                "unexpected server client Some({result}) dtp_close ret value {e}"
-                            );
-                        }
-                    };
-                }
-            });
-        }
-    });
 
     // 模拟客户端程序
     let mut handles = vec![];
@@ -292,17 +221,4 @@ async fn main() {
         std::thread::sleep(Duration::from_millis(10));
     }
     futures::future::join_all(handles).await;
-
-    // join?
-    server_handle.join().unwrap();
-    let _conns = unsafe { Box::from_raw(conns_ptr) };
-    let h = {
-        let mut api_map = DTP_API_MAP.lock().unwrap();
-        api_map
-            .server_handles
-            .remove(&sock)
-            .expect(format!("no server handle for {sock}").as_str())
-    };
-    h.join().unwrap();
-    info!("server conns {} finished", sock);
 }

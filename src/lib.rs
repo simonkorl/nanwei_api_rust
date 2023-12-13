@@ -1,6 +1,7 @@
 use lazy_static::lazy_static;
 use libc::c_int;
 use mio::net::UdpSocket;
+use server::SharedStreams;
 
 use std::collections::HashMap;
 
@@ -38,7 +39,7 @@ pub struct DtpConnection {
     // client only data
     pub sockid: Option<c_int>,
     // server only data
-    pub pconns: Option<Arc<Mutex<DtpServer>>>,
+    pub pconns: Option<Arc<Mutex<SharedStreams>>>,
     pub conn_id: Option<quiche::ConnectionId<'static>>,
 }
 
@@ -86,8 +87,10 @@ pub async fn send(
 }
 
 #[repr(C)]
+#[derive(Clone)]
 pub struct DtpServerConns {
-    pub server: Arc<Mutex<DtpServer>>,
+    // pub server: Arc<Mutex<DtpServer>>,
+    pub streams: Arc<Mutex<SharedStreams>>,
     pub waker: Arc<Mutex<mio::Waker>>,
     pub sockid: c_int,
 }
@@ -122,8 +125,10 @@ pub struct DtpApi {
     ///
     /// 目前这个库不支持 C 一样的 sock 操作，因为可能出 bug
     pub sock_map: HashMap<c_int, Option<Arc<Mutex<UdpSocket>>>>,
-    pub client_map: HashMap<c_int, Arc<Mutex<DtpClient>>>,
-    pub server_map: HashMap<c_int, Arc<Mutex<DtpServer>>>,
+    pub client_map: HashMap<c_int, DtpClient>,
+    pub server_map: HashMap<c_int, DtpServer>,
+    pub server_waker_map: HashMap<c_int, Arc<Mutex<mio::Waker>>>,
+    pub server_shared_map: HashMap<c_int, Arc<Mutex<SharedStreams>>>,
     pub server_handles: HashMap<c_int, std::thread::JoinHandle<()>>,
     pub client_handles: HashMap<c_int, std::thread::JoinHandle<()>>,
     next_fd: c_int, // 模拟产生的下一个 fd 编号
@@ -142,11 +147,15 @@ impl DtpApi {
     fn release_udp_fd(&mut self) {}
 
     fn has_server(&self, sock: c_int) -> bool {
-        self.server_map.get(&sock).is_some()
+        self.server_map.get(&sock).is_some() || self.server_handles.get(&sock).is_some()
+    }
+
+    fn has_running_server(&self, sock: c_int) -> bool {
+        self.server_shared_map.get(&sock).is_some()
     }
 
     fn has_client(&self, sock: c_int) -> bool {
-        self.client_map.get(&sock).is_some()
+        self.client_map.get(&sock).is_some() || self.client_handles.get(&sock).is_some()
     }
 
     fn has_sock(&self, sock: c_int) -> bool {

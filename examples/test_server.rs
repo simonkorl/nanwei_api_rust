@@ -18,7 +18,7 @@ fn dtp_util_send(conn_io_ptr: *mut DtpConnection, stream_id: u64, send_data: &Ve
     info!(
         "开始发送数据总大小：{}, 数据:{:?}",
         data_bytes.len(),
-        data_bytes
+        String::from_utf8(data_bytes.clone())
     );
     let start_millis = Instant::now();
 
@@ -96,7 +96,7 @@ fn dtp_util_recv(conn_io_ptr: *mut DtpConnection) -> String {
             0 => {
                 if loop_count < 20 {
                     info!("{:?} 接收到的数据长度为 0 ，重试中。。。", sock);
-                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    std::thread::sleep(std::time::Duration::from_millis(150));
                     loop_count += 1;
                 } else {
                     info!("{:?} 接收到的数据长度为 0 ，重试次数太多。", sock);
@@ -155,18 +155,8 @@ fn dtp_util_recv(conn_io_ptr: *mut DtpConnection) -> String {
     return String::from_utf8(res).expect("failed to convert String in recv");
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     env_logger::init();
-    let client_num = {
-        if env::args().len() >= 2 {
-            let v: Vec<String> = env::args().collect();
-            v[1].parse::<u32>().unwrap_or(500)
-        } else {
-            500
-        }
-    };
-
     // 模拟启动 server
     let config_ptr = dtp_config_init();
     dtp_config_set_max_idle_timeout(config_ptr, 100000);
@@ -237,62 +227,6 @@ async fn main() {
             });
         }
     });
-
-    // 模拟客户端程序
-    let mut handles = vec![];
-    for _ in 0..client_num {
-        let h = tokio::spawn(async move {
-            let (conn_io_ptr, sock) = {
-                // getConn
-                let sock = dtp_socket();
-                info!("client sock {}", sock);
-
-                let config_ptr = dtp_config_init();
-                dtp_config_set_max_idle_timeout(config_ptr, 100000);
-
-                let ip = std::ffi::CString::new("127.0.0.1").unwrap();
-                let ip_ptr = ip.as_ptr();
-                (dtp_connect(sock, ip_ptr, 4433, config_ptr), sock)
-            };
-
-            // dtp_util_send(conn_io_ptr, 8, &vec![sock as u8]);
-
-            let msg = format!("{}", sock);
-
-            let send = dtp_util_send(conn_io_ptr, 4, &msg.as_bytes().to_vec());
-            info!("{} dtp_util_send, ret: {}", sock, send);
-            let result = loop {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                match dtp_util_recv(conn_io_ptr) {
-                    x if x.len() == 0 => {
-                        debug!("keep recving response");
-                    }
-                    x if x.len() > 0 => {
-                        info!("{} dtp_util_recv, ret: {:?}", sock, x);
-                        break x;
-                    }
-                    e => {
-                        info!("{} dtp_util_recv, ret: {:?}", sock, e);
-                        break e;
-                    }
-                }
-            };
-            println!("{} dtp_util_recv, ret: {:?}", sock, result);
-            // consume conn_io_ptr in dtp_close
-            let ret = dtp_close(conn_io_ptr);
-            if ret == 1 {
-                info!("client {} closed", sock);
-            } else {
-                error!("client {} failed to close", sock);
-            }
-
-            info!("client {} finished", sock);
-        });
-        handles.push(h);
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    futures::future::join_all(handles).await;
-
     // join?
     server_handle.join().unwrap();
     let _conns = unsafe { Box::from_raw(conns_ptr) };

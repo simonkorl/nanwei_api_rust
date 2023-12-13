@@ -22,28 +22,25 @@ fn hex_dump(buf: &[u8]) -> String {
     vec.join("")
 }
 
-pub fn client_loop(
-    poll: Arc<Mutex<mio::Poll>>,
-    events: Arc<Mutex<mio::Events>>,
+fn client_loop(
+    poll: &mut mio::Poll,
+    events: &mut mio::Events,
     conn: Arc<Mutex<Connection>>,
     socket: Arc<Mutex<UdpSocket>>,
-    _peer_addr: SocketAddr,
-    _id: i32,
+    id: i32,
 ) -> Result<()> {
     let mut buf = [0; 65535];
     let mut out = [0; MAX_DATAGRAM_SIZE];
 
-    let mut poll = poll.lock().unwrap();
-    let mut events = events.lock().unwrap();
-
     loop {
         let timeout = conn.lock().unwrap().timeout();
-        poll.poll(&mut events, timeout)?;
+        debug!("{} get timeout {:?}", id, timeout);
+        poll.poll(events, timeout)?;
 
-        let mut conn = conn.lock().unwrap();
         // Read incoming UDP packets from the socket and feed them to quiche,
         // until there are no more packets to read.
         'read: loop {
+            let mut conn = conn.lock().unwrap();
             let socket = socket.lock().unwrap();
             // If the event loop reported no events, it means that the timeout
             // has expired, so handle it without attempting to read packets. We
@@ -93,17 +90,24 @@ pub fn client_loop(
         debug!("done reading");
 
         // TODO: 是否要这个时候退出？
-        if conn.is_closed() {
-            info!("connection closed, {:?}", conn.stats());
+        if conn.lock().unwrap().is_closed() {
+            info!("connection closed, {:?}", conn.lock().unwrap().stats());
             break;
         }
 
+        // let is_in_early_data = conn.lock().unwrap().is_in_early_data();
+        // let is_established = conn.lock().unwrap().is_established();
+        // if is_in_early_data || is_established {
+        // }
+
         // Process all readable streams.
         // 这部分逻辑靠外部 api 实现，这里不再需要处理
+        {}
 
         // Generate outgoing QUIC packets and send them on the UDP socket, until
         // quiche reports that there are no more packets to be sent.
         loop {
+            let mut conn = conn.lock().unwrap();
             let (write, send_info) = match conn.send(&mut out) {
                 Ok(v) => v,
 
@@ -134,23 +138,22 @@ pub fn client_loop(
             debug!("written {}", write);
         }
 
-        if conn.is_closed() {
-            info!("connection closed, {:?}", conn.stats());
+        if conn.lock().unwrap().is_closed() {
+            info!("connection closed, {:?}", conn.lock().unwrap().stats());
             break;
         }
     }
     Ok(())
 }
 #[repr(C)]
-#[derive(Clone)]
 pub struct DtpClient {
-    pub conn: Arc<Mutex<Connection>>, // 在客户端调用函数 connect 之后获得
-    pub socket: Arc<Mutex<UdpSocket>>,
-    pub waker: Arc<Mutex<mio::Waker>>,
-    pub poll: Arc<Mutex<mio::Poll>>, // 注册 socket 之后只在 client 循环中被引用
-    pub events: Arc<Mutex<mio::Events>>, // 只会在 client_loop 中被引用
-    pub peer_addr: SocketAddr,
-    pub sockid: c_int,
+    conn: Arc<Mutex<Connection>>, // 在客户端调用函数 connect 之后获得
+    socket: Arc<Mutex<UdpSocket>>,
+    waker: Arc<Mutex<mio::Waker>>,
+    poll: mio::Poll,     // 注册 socket 之后只在 client 循环中被引用
+    events: mio::Events, // 只会在 client_loop 中被引用
+    peer_addr: SocketAddr,
+    sockid: c_int,
 }
 
 impl DtpClient {
@@ -166,6 +169,22 @@ impl DtpClient {
     //     });
     //     h.join().unwrap();
     // }
+
+    pub fn run(&mut self, id: i32) -> Result<()> {
+        client_loop(&mut self.poll, &mut self.events, self.conn.clone(), self.socket.clone(), id)
+    }
+
+    pub fn get_socket(&self) -> Arc<Mutex<UdpSocket>> {
+        self.socket.clone()
+    }
+
+    pub fn get_waker(&self) -> Arc<Mutex<mio::Waker>> {
+        self.waker.clone()
+    }
+
+    pub fn get_conn(&self) -> Arc<Mutex<quiche::Connection>> {
+        self.conn.clone()
+    }
 
     /// 在 bind 之后调用，进行连接
     /// 可以使用这个函数直接返回一个 DtpClient
@@ -238,8 +257,8 @@ impl DtpClient {
             conn: Arc::new(Mutex::new(conn)),
             socket: socket_arc_clone,
             peer_addr: peer_addr,
-            poll: Arc::new(Mutex::new(poll)),
-            events: Arc::new(Mutex::new(events)),
+            poll: poll,
+            events: events,
             sockid: sockid,
             waker: Arc::new(Mutex::new(waker)),
         })

@@ -1,29 +1,57 @@
 /// 测试 Udp socket 在高并发的场景下会如何表现
 use mio::net::UdpSocket;
-use std::env;
 use rand::Rng;
+use std::collections::HashMap;
+use std::env;
+use std::io;
+use std::net::SocketAddr;
+use std::time::Duration;
+use threads_pool::ThreadPool;
 
 #[derive(Default)]
 struct LoopBuf {
-    cache: Vec<u8>,
+    cache: HashMap<SocketAddr, Vec<u8>>,
 }
 
 impl LoopBuf {
-    fn feed(&mut self, buf: &[u8]) {
-        self.cache.append(&mut buf.to_vec());
+    fn feed(&mut self, from: SocketAddr, buf: &[u8]) {
+        if let Some(entry) = self.cache.get_mut(&from) {
+            entry.append(&mut buf.to_vec());
+        } else {
+            self.cache.insert(from.clone(), buf.to_vec());
+        }
     }
 
-    fn get_first(&mut self) -> Option<u64> {
-        if self.cache.len() >= 1200 {
-            let mut num = [0u8; 8];
-            num = self.cache[..8].try_into().unwrap();
-            let no = u64::from_ne_bytes(num);
-            self.cache = self.cache[1200..].to_vec();
-            Some(no)
+    fn get(&mut self, from: SocketAddr) -> Option<u64> {
+        if let Some(entry) = self.cache.get_mut(&from) {
+            if entry.len() >= 1200 {
+                let mut num = [0u8; 8];
+                num = entry[..8].try_into().unwrap();
+                let no = u64::from_ne_bytes(num);
+                *entry = entry[1200..].to_vec();
+                Some(no)
+            } else {
+                None
+            }
         } else {
             None
         }
     }
+
+    fn get_first(&mut self) -> Option<(SocketAddr, u64)> {
+        for (k, v) in self.cache.iter() {
+            if v.len() >= 1200 {
+                return Some((k.clone(), self.get(k.clone()).unwrap()));
+            } else {
+                continue;
+            }
+        }
+        return None;
+    }
+}
+
+fn would_block(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::WouldBlock
 }
 
 #[tokio::main]
@@ -48,26 +76,39 @@ async fn main() {
             .register(&mut server_socket, mio::Token(0), mio::Interest::READABLE)
             .unwrap();
         loop {
-            poll.poll(&mut events, None).unwrap();
+            poll.poll(&mut events, Some(Duration::from_secs(5)))
+                .unwrap();
+            if events.is_empty() {
+                println!("server timeout, exit!!");
+                break;
+            }
             // 接收数据 1200B，头部有一个 u64 的 id
-            let from = match server_socket.recv_from(&mut buf) {
-                Ok((size, from)) => {
-                    println!("server recv {}, {:?}", size, from);
-                    loop_buf.feed(&buf[..size]);
-                    Some(from)
+            loop {
+                match server_socket.recv_from(&mut buf) {
+                    Ok((size, from)) => {
+                        println!("server recv {}, {:?}", size, from);
+                        loop_buf.feed(from, &buf[..size]);
+                    }
+                    Err(w) if would_block(&w) => {
+                        break;
+                    }
+                    Err(e) => {
+                        println!("server recv err {:?}", e);
+                    }
                 }
-                Err(e) => {
-                    println!("server recv err {:?}", e);
-                    None
-                },
-            };
+            }
+
             // 发送数据 1200B
-            while let Some(client_no) = loop_buf.get_first() {
+            while let Some((from, client_no)) = loop_buf.get_first() {
                 let msg = format!("Reply: server recved {}", client_no);
                 buf[..8].copy_from_slice(&msg.len().to_ne_bytes());
                 buf[8..8 + msg.len()].copy_from_slice(msg.as_bytes());
-                match server_socket.send_to(&buf[..1200], from.unwrap()) {
-                    Ok(size) => println!("server replied {} successfully, {}", size, String::from_utf8(buf[8..8 + msg.len()].to_vec()).unwrap()),
+                match server_socket.send_to(&buf[..1200], from) {
+                    Ok(size) => println!(
+                        "server replied {} successfully, {}",
+                        size,
+                        String::from_utf8(buf[8..8 + msg.len()].to_vec()).unwrap()
+                    ),
                     Err(e) => println!("server failed to reply to {} due to {}", client_no, e),
                 }
             }
@@ -77,7 +118,8 @@ async fn main() {
     // 模拟客户端程序
     let mut handles = vec![];
     for i in 0..client_num {
-        let h = std::thread::spawn(move || {
+        handles.push(std::thread::spawn(move || {
+            // pool.execute(move || {
             let mut client_socket = UdpSocket::bind("0.0.0.0:0".parse().unwrap()).unwrap();
             // client_socket
             //     .connect("127.0.0.1:5862".parse().unwrap())
@@ -92,22 +134,26 @@ async fn main() {
             let bytes = (i as u64).to_ne_bytes();
             buf[..8].clone_from_slice(&bytes);
             match client_socket.send_to(&buf[..1200], "127.0.0.1:5862".parse().unwrap()) {
-                Ok(size) => println!("client {} send {}", size, i),
-                Err(e) => println!("client {} send err {:?}", e, i),
+                Ok(size) => println!("client {} retrying, send {}", i, size),
+                Err(e) => println!("client {} retry send err {:?}", i, e),
             };
             let mut get_response = false;
             let mut rng = rand::thread_rng();
             while !get_response {
-                let random_sleep_time = rng.gen_range(0..1000);
-                poll.poll(&mut events, Some(std::time::Duration::from_secs(random_sleep_time))).unwrap();
+                let random_sleep_time = rng.gen_range(0..100);
+                poll.poll(
+                    &mut events,
+                    Some(std::time::Duration::from_secs(random_sleep_time)),
+                )
+                .unwrap();
 
                 if events.is_empty() {
                     // 发送数据 1200B
                     let bytes = (i as u64).to_ne_bytes();
                     buf[..8].clone_from_slice(&bytes);
                     match client_socket.send_to(&buf[..1200], "127.0.0.1:5862".parse().unwrap()) {
-                        Ok(size) => println!("client {} send {}", size, i),
-                        Err(e) => println!("client {} send err {:?}", e, i),
+                        Ok(size) => println!("client {} send {}", i, size),
+                        Err(e) => println!("client {} send err {:?}", i, e),
                     };
                 }
 
@@ -117,14 +163,15 @@ async fn main() {
                             // 接收数据 1200B
                             match client_socket.recv(&mut buf) {
                                 Ok(size) => {
-                                    let str_len = usize::from_ne_bytes(buf[..8].try_into().unwrap());
+                                    let str_len =
+                                        usize::from_ne_bytes(buf[..8].try_into().unwrap());
                                     println!(
                                         "client {} recv {} of {}",
                                         i,
                                         size,
                                         String::from_utf8(buf[8..8 + str_len].to_vec()).unwrap()
                                     )
-                                },
+                                }
                                 Err(e) => println!("client {} recv err {:?} ", i, e),
                             }
                             get_response = true;
@@ -134,10 +181,9 @@ async fn main() {
                         }
                     }
                 }
-
             }
-        });
-        handles.push(h);
+        }));
+        // .expect("failed to execute");
     }
 
     for h in handles {

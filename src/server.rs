@@ -20,10 +20,18 @@ pub struct PartialResponse {
     written: usize,
 }
 
+#[derive(Default)]
+pub struct SharedStreams {
+    // pub readables: HashMap<u64, (Vec<u8>, bool)>,
+    pub client_status:
+        HashMap<quiche::ConnectionId<'static>, (Arc<Mutex<quiche::Connection>>, ClientStatus)>,
+}
+
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum ClientStatus {
     NotConnected,
     Connected,
+    Accepted,
     Close,
     Wait,
 }
@@ -32,10 +40,9 @@ pub struct Client {
     pub conn: Arc<Mutex<quiche::Connection>>,
 
     pub partial_responses: Arc<Mutex<HashMap<u64, PartialResponse>>>,
+    // pub status: Arc<Mutex<ClientStatus>>,
 
-    pub status: Arc<Mutex<ClientStatus>>,
-
-    pub scid: quiche::ConnectionId<'static>,
+    // pub scid: quiche::ConnectionId<'static>,
 }
 
 type ClientMap = HashMap<quiche::ConnectionId<'static>, Client>;
@@ -47,19 +54,25 @@ struct ClientRequest {
     client_id: i32,
 }
 
-pub fn server_loop(
-    clients: Arc<Mutex<ClientMap>>,
-    poll: Arc<Mutex<mio::Poll>>,
-    events: Arc<Mutex<mio::Events>>,
+struct ServerArgs<'a> {
+    clients: &'a mut ClientMap,
+    poll: &'a mut mio::Poll,
+    events: &'a mut mio::Events,
     socket: Arc<Mutex<UdpSocket>>,
     config: Arc<Mutex<Config>>,
-    _waker: Arc<Mutex<mio::Waker>>,
-) -> Result<()> {
+    shared_streams: Arc<Mutex<SharedStreams>>,
+}
+
+fn server_loop(args: ServerArgs) -> Result<()> {
     let mut buf = [0; 65535];
     let mut out = [0; MAX_DATAGRAM_SIZE];
 
-    let mut poll = poll.lock().unwrap();
-    let mut events = events.lock().unwrap();
+    let clients = args.clients;
+    let poll = args.poll;
+    let events = args.events;
+    let socket = args.socket;
+    let config = args.config;
+    let shared_streams = args.shared_streams;
 
     let rng = SystemRandom::new();
     let conn_id_seed = ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng).unwrap();
@@ -72,14 +85,13 @@ pub fn server_loop(
         // Find the shorter timeout from all the active connections.
         //
         // TODO: use event loop that properly supports timers
+        debug!("begin of loop");
         let timeout = clients
-            .lock()
-            .unwrap()
             .values()
             .filter_map(|c| c.conn.lock().unwrap().timeout())
             .min();
         debug!("get timeout {:?}", timeout);
-        poll.poll(&mut events, timeout).unwrap();
+        poll.poll(events, timeout).unwrap();
         debug!("after poll");
         let socket = socket.lock().unwrap();
         debug!("before reading");
@@ -93,8 +105,6 @@ pub fn server_loop(
                 debug!("timed out");
 
                 clients
-                    .lock()
-                    .unwrap()
                     .values_mut()
                     .for_each(|c| c.conn.lock().unwrap().on_timeout());
 
@@ -138,10 +148,7 @@ pub fn server_loop(
 
             // Lookup a connection based on the packet's connection ID. If there
             // is no connection matching, create a new one.
-            let mut clients_lock = clients.lock().unwrap();
-            let client = if !clients_lock.contains_key(&hdr.dcid)
-                && !clients_lock.contains_key(&conn_id)
-            {
+            let client = if !clients.contains_key(&hdr.dcid) && !clients.contains_key(&conn_id) {
                 if hdr.ty != quiche::Type::Initial {
                     error!("Packet is not Initial");
                     continue 'read;
@@ -232,21 +239,29 @@ pub fn server_loop(
                 )
                 .unwrap();
 
+                let conn_arc = Arc::new(Mutex::new(conn));
+
                 let client = Client {
-                    conn: Arc::new(Mutex::new(conn)),
+                    conn: conn_arc.clone(),
                     partial_responses: Arc::new(Mutex::new(HashMap::new())),
-                    status: Arc::new(Mutex::new(ClientStatus::Connected)),
-                    scid: scid.clone(),
+                    // status: Arc::new(Mutex::new(ClientStatus::Connected)),
+                    // scid: scid.clone(),
                 };
 
-                clients_lock.insert(scid.clone(), client);
+                clients.insert(scid.clone(), client);
 
-                clients_lock.get_mut(&scid).unwrap()
+                debug!("before status lock");
+                let mut shared_streams_lock = shared_streams.lock().unwrap();
+                shared_streams_lock
+                    .client_status
+                    .insert(scid.clone(), (conn_arc.clone(), ClientStatus::Connected));
+                debug!("after status lock");
+                clients.get_mut(&scid).unwrap()
             } else {
-                match clients_lock.get_mut(&hdr.dcid) {
+                match clients.get_mut(&hdr.dcid) {
                     Some(v) => v,
 
-                    None => clients_lock.get_mut(&conn_id).unwrap(),
+                    None => clients.get_mut(&conn_id).unwrap(),
                 }
             };
 
@@ -296,9 +311,11 @@ pub fn server_loop(
                 }
                 {
                     // Process all readable streams.
-                    // let readable = { client.conn.lock().unwrap().readable() };
+                    // TODO: 考虑把数据从 stream 中读出到一个中间 cache 当中，这样就可以百分之百同步
+                    // TODO: 处理 loop，防止出现任何问题
+                    // let readable = client.conn.lock().unwrap().readable();
+                    // let mut shared_streams_lock = shared_streams.lock().unwrap();
                     // for s in readable {
-                    //     debug!("in readable {}", s);
                     //     loop {
                     //         let recv = client.conn.lock().unwrap().stream_recv(s, &mut buf);
                     //         match recv {
@@ -319,46 +336,20 @@ pub fn server_loop(
                     //                     fin
                     //                 );
 
-                    //                 let mut res = stream_buf.to_vec();
-                    //                 res.remove(0);
-                    //                 res.insert(0, '+' as u8);
-
-                    //                 let written = match client
-                    //                     .conn
-                    //                     .lock()
-                    //                     .unwrap()
-                    //                     .stream_send(4, &res, true)
-                    //                 {
-                    //                     Ok(v) => v,
-
-                    //                     Err(quiche::Error::Done) => 0,
-
-                    //                     Err(e) => {
-                    //                         error!(
-                    //                             "{} stream send failed {:?}",
-                    //                             client.conn.lock().unwrap().trace_id(),
-                    //                             e
-                    //                         );
-                    //                         continue;
-                    //                     }
-                    //                 };
-                    //                 debug!("write response {}", written);
-
-                    //                 if written < res.len() {
-                    //                     let response = PartialResponse { body: res, written };
-                    //                     client
-                    //                         .partial_responses
-                    //                         .lock()
-                    //                         .unwrap()
-                    //                         .insert(4, response);
+                    //                 if let Some((r, f)) = shared_streams_lock.readables.get_mut(&s) {
+                    //                     r.append(&mut stream_buf.to_vec());
+                    //                     *f = fin;
+                    //                 } else {
+                    //                     shared_streams_lock.readables.insert(s, (stream_buf.to_vec(), fin));
                     //                 }
                     //             }
                     //             Err(_) => break,
                     //         }
                     //     }
+                    //  debug!("in readable {}", s);
                     // }
-                    debug!("after readable");
                 }
+                debug!("after readable");
             }
         }
 
@@ -366,14 +357,14 @@ pub fn server_loop(
         // them on the UDP socket, until quiche reports that there are no more
         // packets to be sent.
         debug!("begin writing");
-        for client in clients.lock().unwrap().values_mut() {
+        for client in clients.values_mut() {
             debug!(
                 "write loop: client {}",
                 client.conn.clone().lock().unwrap().trace_id()
             );
             loop {
                 let mut conn_lock = client.conn.lock().unwrap();
-                debug!("hello");
+
                 let (write, send_info) = match conn_lock.send(&mut out) {
                     Ok(v) => v,
 
@@ -405,28 +396,34 @@ pub fn server_loop(
 
         // Garbage collect closed connections.
         debug!("before garbage");
-        clients.lock().unwrap().retain(|_, ref mut c| {
-            debug!("Collecting garbage");
-            let conn_lock = c.conn.lock().unwrap();
-            let conn_status = *c.status.lock().unwrap();
-            if conn_lock.is_closed() {
-                if conn_status == ClientStatus::Close {
-                    info!(
-                        "{} connection collected {:?}",
-                        conn_lock.trace_id(),
-                        conn_lock.stats()
-                    );
-                } else {
-                    info!(
-                        "{} connection cannot be collected, need client to close",
-                        conn_lock.trace_id(),
-                    );
-                }
-            }
+        {
+            let client_status = &shared_streams.lock().unwrap().client_status;
+            clients.retain(|_, ref mut c| {
+                let conn_lock = c.conn.lock().unwrap();
+                let scid = conn_lock.source_id();
+                if let Some((_, conn_status)) = client_status.get(&scid) {
+                    if conn_lock.is_closed() {
+                        if conn_status == &ClientStatus::Close {
+                            debug!(
+                                "{} connection collected {:?}",
+                                conn_lock.trace_id(),
+                                conn_lock.stats()
+                            );
+                        } else {
+                            debug!(
+                                "{} connection cannot be collected, need client to close",
+                                conn_lock.trace_id(),
+                            );
+                        }
+                    }
 
-            !conn_lock.is_closed() || conn_status != ClientStatus::Close
-        });
-        debug!("after garbage")
+                    !conn_lock.is_closed() || conn_status != &ClientStatus::Close
+                } else {
+                    unreachable!();
+                }
+            });
+        }
+        debug!("after garbage");
     }
 }
 
@@ -599,30 +596,50 @@ fn handle_writable(
 }
 
 #[repr(C)]
-#[derive(Clone)]
 pub struct DtpServer {
-    pub clients: Arc<Mutex<ClientMap>>,
-    pub socket: Arc<Mutex<UdpSocket>>,
-    pub poll: Arc<Mutex<mio::Poll>>, // 注册 socket 之后只在 client 循环中被引用
-    pub events: Arc<Mutex<mio::Events>>, // 只会在 server_loop 中被引用
-    pub waker: Arc<Mutex<mio::Waker>>,
-    pub config: Option<Arc<Mutex<Config>>>,
-    pub sockid: Option<c_int>,
+    clients: ClientMap,
+    poll: mio::Poll,     // 注册 socket 之后只在 client 循环中被引用
+    events: mio::Events, // 只会在 server_loop 中被引用
+    socket: Arc<Mutex<UdpSocket>>,
+    waker: Arc<Mutex<mio::Waker>>,
+    shared_streams: Arc<Mutex<SharedStreams>>,
+    config: Option<Arc<Mutex<Config>>>,
+    sockid: Option<c_int>,
 }
 
 impl DtpServer {
-    // pub fn run(&self) {
-    //     let clients = self.clients.clone().unwrap().clone();
-    //     let p = self.poll.clone().unwrap().clone();
-    //     let e = self.events.clone().unwrap().clone();
-    //     let s = self.socket.clone().unwrap().clone();
-    //     let c = self.config.clone().unwrap().clone();
-    //     let w = self.waker.clone().unwrap().clone();
-    //     let h = std::thread::spawn(move || {
-    //         server_loop(clients, p, e, s, c, w).unwrap();
-    //     });
-    //     h.join().unwrap();
-    // }
+    pub fn run(&mut self) -> Result<()> {
+        let args = self.get_run_args();
+        server_loop(args)
+    }
+
+    pub fn get_waker(&self) -> Arc<Mutex<mio::Waker>> {
+        self.waker.clone()
+    }
+
+    pub fn get_socket(&self) -> Arc<Mutex<UdpSocket>> {
+        self.socket.clone()
+    }
+
+    pub fn get_shared_streams(&self) -> Arc<Mutex<SharedStreams>> {
+        self.shared_streams.clone()
+    }
+
+    pub fn set_config(&mut self, config_arc: Arc<Mutex<Config>>) -> bool {
+        self.config = Some(config_arc.clone());
+        true
+    }
+
+    fn get_run_args(&mut self) -> ServerArgs {
+        ServerArgs {
+            clients: &mut self.clients,
+            poll: &mut self.poll,
+            events: &mut self.events,
+            socket: self.socket.clone(),
+            config: self.config.clone().unwrap().clone(),
+            shared_streams: self.shared_streams.clone(),
+        }
+    }
 
     /// 根据目的地址创建一个 DtpServer
     /// 其可以通过调用 run 来运行
@@ -641,13 +658,14 @@ impl DtpServer {
 
         let waker = mio::Waker::new(poll.registry(), mio::Token(42)).unwrap();
 
-        let clients = Arc::new(Mutex::new(ClientMap::new()));
+        let clients = ClientMap::new();
 
         Ok(DtpServer {
-            poll: Arc::new(Mutex::new(poll)),
-            events: Arc::new(Mutex::new(events)),
-            clients: clients,
+            poll,
+            events,
+            clients,
             socket: Arc::new(Mutex::new(socket)),
+            shared_streams: Arc::new(Mutex::new(SharedStreams::default())),
             config: Some(config),
             sockid: None,
             waker: Arc::new(Mutex::new(waker)),
@@ -672,13 +690,14 @@ impl DtpServer {
 
         let waker = mio::Waker::new(poll.registry(), mio::Token(42)).unwrap();
 
-        let clients = Arc::new(Mutex::new(ClientMap::new()));
+        let clients = ClientMap::new();
 
         Ok(DtpServer {
-            poll: Arc::new(Mutex::new(poll)),
-            events: Arc::new(Mutex::new(events)),
-            clients: clients,
+            poll,
+            events,
+            clients,
             socket: Arc::new(Mutex::new(socket)),
+            shared_streams: Arc::new(Mutex::new(SharedStreams::default())),
             config: None,
             sockid: Some(sockid),
             waker: Arc::new(Mutex::new(waker)),
