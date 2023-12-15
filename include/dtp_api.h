@@ -13,6 +13,13 @@ struct conn_io {
     void *data;
 };
 
+enum dtp_error {
+    DTP_CLOSED = -22,
+    DTP_NOT_ESTABLISHED = -42,
+    DTP_NULL = -404,
+    DTP_DEFAULT_ERR = -444
+};
+
 //----------API接口函数声明---------
 
 /**

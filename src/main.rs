@@ -169,7 +169,7 @@ async fn main() {
 
     // 模拟启动 server
     let config_ptr = dtp_config_init();
-    dtp_config_set_max_idle_timeout(config_ptr, 100000);
+    dtp_config_set_max_idle_timeout(config_ptr, 3000);
 
     let sock = dtp_socket();
 
@@ -248,7 +248,7 @@ async fn main() {
                 info!("client sock {}", sock);
 
                 let config_ptr = dtp_config_init();
-                dtp_config_set_max_idle_timeout(config_ptr, 100000);
+                dtp_config_set_max_idle_timeout(config_ptr, 3000);
 
                 let ip = std::ffi::CString::new("127.0.0.1").unwrap();
                 let ip_ptr = ip.as_ptr();

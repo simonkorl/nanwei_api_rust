@@ -39,6 +39,7 @@ const QUICHE_PROTOCOL_VERSION: u32 = 0x00000001;
 
 #[repr(C)]
 pub enum DtpError {
+    DtpClosed = -22,
     DtpNotEstablished = -42,
     DtpNull = -404,
     DtpDefaultErr = -444,
@@ -317,16 +318,16 @@ pub extern "C" fn dtp_connect(
 
     // 等待连接完全建立再返回，以防出现难以预测的情况
     // ? 不过不确定是否可以得到正确的结果
-    let conn_wait = conn_clone.clone();
-    loop {
-        let is_established = conn_wait.lock().unwrap().is_established();
-        let is_in_early_data = conn_wait.lock().unwrap().is_in_early_data();
-        if is_established || is_in_early_data {
-            break;
-        } else {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-    }
+    // let conn_wait = conn_clone.clone();
+    // loop {
+    //     let is_established = conn_wait.lock().unwrap().is_established();
+    //     let is_in_early_data = conn_wait.lock().unwrap().is_in_early_data();
+    //     if is_established || is_in_early_data {
+    //         break;
+    //     } else {
+    //         std::thread::sleep(std::time::Duration::from_millis(100));
+    //     }
+    // }
 
     let conn_io = DtpConnection {
         // client: Some(client_arc.clone()),
@@ -390,7 +391,9 @@ pub extern "C" fn dtp_recv(
     let mut conn_lock = conn.lock().unwrap();
 
     debug!("after conn_lock");
-    if !conn_lock.is_established() && !conn_lock.is_in_early_data() {
+    if conn_lock.is_closed() {
+        return DtpError::DtpClosed as c_int;
+    } else if !conn_lock.is_established() && !conn_lock.is_in_early_data() {
         debug!(
             "is_established{} in_early_data {} closed {}",
             conn_lock.is_established(),
@@ -475,7 +478,9 @@ pub extern "C" fn dtp_send(
     let waker = conn_io.waker.clone();
     let mut conn_lock = conn.lock().unwrap();
 
-    if !conn_lock.is_established() && !conn_lock.is_in_early_data() {
+    if conn_lock.is_closed() {
+        return DtpError::DtpClosed as c_int;
+    } else if !conn_lock.is_established() && !conn_lock.is_in_early_data() {
         info!(
             "dtp_send is_established {}, is_in_early_data {}, is_closed {}, is_timed_out {}",
             conn_lock.is_established(),
@@ -517,7 +522,12 @@ pub extern "C" fn dtp_close(conn_io: *mut DtpConnection) -> c_int {
     };
 
     if !conn_io.is_server_side {
-        if conn_io.conn.lock().unwrap().is_established() {
+        if conn_io.conn.lock().unwrap().is_closed() {
+            // 如果已经关闭了，那么就直接回收这个 conn_io
+            // !如果这个函数被多次在同一个 conn_io 上调用那么会出现 bug
+            let _box_c = unsafe { Box::from_raw(conn_io) };
+            return 1;
+        } else if conn_io.conn.lock().unwrap().is_established() {
             info!("send close in {:?}", conn_io.sockid);
             // 发送 close 信息
             conn_io
